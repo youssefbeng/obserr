@@ -6,6 +6,36 @@
 <h1>Job : {{ name }} <small>({{ source }})</small></h1>
 <p>Failed Runs : {{ failed_runs_count }}</p>
 
+<h2>Historique des Incidents</h2>
+{% if incidents.is_empty() %}
+  <p>Aucun Incident enregistré.</p>
+{% else %}
+  <table>
+    <thead>
+      <tr>
+        <th>Incident</th>
+        <th>Statut</th>
+        <th>Cause initiale</th>
+        <th>Ouvert à</th>
+        <th>Fermé à</th>
+        <th>Durée</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for inc in incidents %}
+      <tr>
+        <td>#{{ inc.id }}</td>
+        <td>{{ inc.status }}</td>
+        <td>{{ inc.cause }}</td>
+        <td>{{ inc.opened_at }}</td>
+        <td>{{ inc.closed_at }}</td>
+        <td>{{ inc.duration }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+
 <h2>Historique des Runs</h2>
 {% if runs.is_empty() %}
   <p>Aucun Run enregistré.</p>

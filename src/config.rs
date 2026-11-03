@@ -9,6 +9,8 @@ pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
     #[serde(default)]
+    pub channel: ChannelConfig,
+    #[serde(default)]
     pub sources: HashMap<String, SourceConfig>,
 }
 
@@ -18,6 +20,8 @@ pub struct ServerConfig {
     pub listen: String,
     #[serde(default = "default_database_path")]
     pub database_path: String,
+    #[serde(default = "default_public_url")]
+    pub public_url: String,
 }
 
 impl Default for ServerConfig {
@@ -25,8 +29,15 @@ impl Default for ServerConfig {
         Self {
             listen: default_listen(),
             database_path: default_database_path(),
+            public_url: default_public_url(),
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ChannelConfig {
+    #[serde(default)]
+    pub webhook_url: Option<String>,
 }
 
 fn default_listen() -> String {
@@ -35,6 +46,10 @@ fn default_listen() -> String {
 
 fn default_database_path() -> String {
     "obserr.db".to_string()
+}
+
+fn default_public_url() -> String {
+    "http://127.0.0.1:8080".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -61,5 +76,10 @@ impl Config {
             .iter()
             .find(|(_, src)| src.token == token)
             .map(|(name, _)| name.clone())
+    }
+
+    /// Retourne l'URL du webhook Slack configurée sur le `Channel`.
+    pub fn slack_webhook_url(&self) -> Option<&str> {
+        self.channel.webhook_url.as_deref()
     }
 }
