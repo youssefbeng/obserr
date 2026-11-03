@@ -62,7 +62,10 @@ async fn ingest_event(
     headers: HeaderMap,
     Json(payload): Json<EventPayload>,
 ) -> Result<StatusCode, StatusCode> {
-    let source = auth::authenticate_source(&headers, &state.config)?;
+    let event_ts = payload.timestamp.unwrap_or_else(Utc::now);
+    state.reload_if_changed(None);
+    let cfg = state.current_config();
+    let source = auth::authenticate_source(&headers, &cfg)?;
 
     let kind = match payload.event {
         WireEventType::Started => IngestPayloadKind::Started,
@@ -80,7 +83,7 @@ async fn ingest_event(
         source,
         job_name: payload.job,
         run_id: payload.run_id,
-        timestamp: payload.timestamp.unwrap_or_else(Utc::now),
+        timestamp: event_ts,
         external_url: payload.external_url,
         kind,
     };
@@ -93,10 +96,7 @@ async fn ingest_event(
     };
 
     if let Some(alert) = notification {
-        let _ = state
-            .channel
-            .send(&alert, &state.config.server.public_url)
-            .await;
+        let _ = state.channel.send(&alert, &cfg.server.public_url).await;
     }
 
     Ok(StatusCode::OK)

@@ -13,6 +13,10 @@
         <th>Job</th>
         <th>Source</th>
         <th>État</th>
+        <th>Schedule</th>
+        <th>Propriétaire</th>
+        <th>Tags</th>
+        <th>Prochain créneau</th>
         <th>Dernier Run</th>
         <th>Début</th>
         <th>Fin</th>
@@ -25,6 +29,10 @@
         <td><a href="/jobs/{{ item.source }}/{{ item.name }}">{{ item.name }}</a></td>
         <td>{{ item.source }}</td>
         <td>{{ item.incident_state }}</td>
+        <td>{{ item.schedule_summary }}</td>
+        <td>{{ item.owner }}</td>
+        <td>{{ item.tags }}</td>
+        <td>{{ item.next_slot }}</td>
         <td>{{ item.latest_status }}</td>
         <td>{{ item.latest_started_at }}</td>
         <td>{{ item.latest_finished_at }}</td>

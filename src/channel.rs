@@ -20,18 +20,28 @@ pub trait Channel: Send + Sync {
         notification: &'a IncidentNotification,
         public_url: &'a str,
     ) -> BoxFuture<'a, Result<()>>;
+
+    /// Met à jour à chaud l'URL de destination du `Channel` lors d'un rechargement de configuration.
+    fn update_webhook_url(&self, _webhook_url: Option<String>) {}
 }
 
 /// Adapter de `Channel` envoyant les alertes vers un *Incoming Webhook* Slack (compatible offre gratuite).
 #[derive(Debug, Clone)]
 pub struct SlackWebhook {
-    webhook_url: Option<String>,
+    webhook_url: Arc<Mutex<Option<String>>>,
 }
 
 impl SlackWebhook {
     /// Construit un adapter `SlackWebhook` à partir de l'URL de webhook optionnelle issue de la configuration.
     pub fn new(webhook_url: Option<String>) -> Self {
-        Self { webhook_url }
+        Self {
+            webhook_url: Arc::new(Mutex::new(webhook_url)),
+        }
+    }
+
+    /// Met à jour à chaud l'URL de l'*Incoming Webhook* Slack lors d'un rechargement du fichier TOML.
+    pub fn set_webhook_url(&self, webhook_url: Option<String>) {
+        *self.webhook_url.lock().expect("slack webhook mutex poisoned") = webhook_url;
     }
 
     /// Formate le texte du message Slack d'ouverture ou de résolution d'`Incident`.
@@ -102,14 +112,24 @@ impl Channel for SlackWebhook {
         notification: &'a IncidentNotification,
         public_url: &'a str,
     ) -> BoxFuture<'a, Result<()>> {
+        let url_opt = self
+            .webhook_url
+            .lock()
+            .expect("slack webhook mutex poisoned")
+            .clone()
+            .filter(|u| !u.is_empty());
         Box::pin(async move {
-            let Some(url) = self.webhook_url.as_deref().filter(|u| !u.is_empty()) else {
+            let Some(url) = url_opt else {
                 return Ok(());
             };
             let text = Self::format_message(notification, public_url);
             let body = json!({ "text": text }).to_string();
-            post_json_webhook(url, &body).await
+            post_json_webhook(&url, &body).await
         })
+    }
+
+    fn update_webhook_url(&self, webhook_url: Option<String>) {
+        self.set_webhook_url(webhook_url);
     }
 }
 

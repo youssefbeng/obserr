@@ -112,6 +112,7 @@ cat >"$TMP_DIR/obserr.toml" <<EOF
 listen = "127.0.0.1:${OBSERR_PORT}"
 database_path = "${TMP_DIR}/obserr.db"
 public_url = "http://127.0.0.1:${OBSERR_PORT}"
+timezone = "UTC"
 
 [channel]
 webhook_url = "http://127.0.0.1:${WEBHOOK_PORT}/slack"
@@ -121,13 +122,24 @@ token = "secret-dbt-token"
 
 [sources.airflow-prod]
 token = "secret-airflow-token"
+
+[jobs.dbt-prod.compta_nightly]
+schedule = "0 2 * * *"
+grace = "30m"
+timezone = "Europe/Paris"
+owner = "equipe-finance"
+tags = ["finance", "nightly"]
+
+[jobs.airflow-prod.adhoc_sync]
+owner = "equipe-data"
+tags = ["adhoc"]
 EOF
 
 "$ROOT_DIR/target/debug/obserr" serve --config "$TMP_DIR/obserr.toml" &
 SERVER_PID=$!
 wait_for_server
 
-echo "==> 3. Vérification de /health (200) et du rejet d'authentification (401)..."
+echo "==> 3. Vérification de /health (200), du rejet d'authentification (401) et des Jobs pré-déclarés dans le TOML..."
 health_code="$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${OBSERR_PORT}/health")"
 assert_eq "$health_code" "200" "GET /health"
 
@@ -136,6 +148,19 @@ unauth_code="$(curl -s -o /dev/null -w "%{http_code}" -X POST \
   -d '{"job":"test","event":"started"}' \
   "http://127.0.0.1:${OBSERR_PORT}/api/v1/events")"
 assert_eq "$unauth_code" "401" "POST /api/v1/events sans token"
+
+initial_dash="$(curl -fsS "http://127.0.0.1:${OBSERR_PORT}/")"
+assert_contains "$initial_dash" "compta_nightly" "Job pré-déclaré compta_nightly sur /"
+assert_contains "$initial_dash" "OK" "Statut OK pour Job avec Schedule"
+assert_contains "$initial_dash" "0 2 * * *" "Expression cron sur /"
+assert_contains "$initial_dash" "equipe-finance" "Owner sur /"
+assert_contains "$initial_dash" "finance, nightly" "Tags sur /"
+assert_contains "$initial_dash" "adhoc_sync" "Job sans Schedule sur /"
+assert_contains "$initial_dash" "Sans Schedule" "Statut Sans Schedule sur /"
+
+compta_detail="$(curl -fsS "http://127.0.0.1:${OBSERR_PORT}/jobs/dbt-prod/compta_nightly")"
+assert_contains "$compta_detail" "Europe/Paris" "Fuseau horaire sur page détail Job"
+assert_contains "$compta_detail" "30m" "Délai grace sur page détail Job"
 
 echo "==> 4. Enregistrement d'un Job sain (airflow-prod / alpha_healthy)..."
 curl -fsS -X POST "http://127.0.0.1:${OBSERR_PORT}/api/v1/events" \
@@ -227,28 +252,76 @@ assert_contains "$detail_html" "Historique des Incidents" "section Incidents sur
 assert_contains "$detail_html" "closed" "statut closed dans l'historique du Job"
 assert_contains "$detail_html" "1200s" "durée de l'Incident dans l'historique du Job"
 
-echo "==> 9. Simulation d'un Run abandonné sur airflow-prod / finance_hourly (pour laisser 1 Incident ouvert)..."
-curl -fsS -X POST "http://127.0.0.1:${OBSERR_PORT}/api/v1/events" \
+echo "==> 9. Rechargement à chaud du TOML (modification Schedule, owner, tags et rotation de token de Source)..."
+cat >"$TMP_DIR/obserr.toml" <<EOF
+[server]
+listen = "127.0.0.1:${OBSERR_PORT}"
+database_path = "${TMP_DIR}/obserr.db"
+public_url = "http://127.0.0.1:${OBSERR_PORT}"
+timezone = "UTC"
+
+[channel]
+webhook_url = "http://127.0.0.1:${WEBHOOK_PORT}/slack"
+
+[sources.dbt-prod]
+token = "secret-dbt-token"
+
+[sources.airflow-prod]
+token = "rotated-airflow-token"
+
+[jobs.dbt-prod.compta_nightly]
+schedule = "30 3 * * *"
+grace = "45m"
+timezone = "Europe/Paris"
+owner = "equipe-compta-v2"
+tags = ["finance", "nightly", "hot-reload"]
+
+[jobs.airflow-prod.adhoc_sync]
+schedule = "0 6 * * *"
+grace = "15m"
+owner = "equipe-sre"
+tags = ["sla", "critical"]
+EOF
+
+reloaded_dash="$(curl -fsS "http://127.0.0.1:${OBSERR_PORT}/")"
+assert_contains "$reloaded_dash" "30 3 * * *" "Schedule mis à jour à chaud sur /"
+assert_contains "$reloaded_dash" "equipe-compta-v2" "owner mis à jour à chaud sur /"
+assert_contains "$reloaded_dash" "hot-reload" "tag mis à jour à chaud sur /"
+assert_contains "$reloaded_dash" "0 6 * * *" "nouveau Schedule sur adhoc_sync"
+
+adhoc_detail="$(curl -fsS "http://127.0.0.1:${OBSERR_PORT}/jobs/airflow-prod/adhoc_sync")"
+assert_contains "$adhoc_detail" "OK" "adhoc_sync passé au statut OK après ajout de Schedule"
+assert_not_contains "$adhoc_detail" "Sans Schedule" "adhoc_sync n'est plus Sans Schedule"
+
+old_token_code="$(curl -s -o /dev/null -w "%{http_code}" -X POST \
   -H "Authorization: Bearer secret-airflow-token" \
+  -H "Content-Type: application/json" \
+  -d '{"job":"finance_hourly","event":"started"}' \
+  "http://127.0.0.1:${OBSERR_PORT}/api/v1/events")"
+assert_eq "$old_token_code" "401" "ancien token révoqué à chaud"
+
+echo "==> 10. Simulation d'un Run abandonné avec le nouveau token rechargé à chaud sur airflow-prod / finance_hourly..."
+curl -fsS -X POST "http://127.0.0.1:${OBSERR_PORT}/api/v1/events" \
+  -H "Authorization: Bearer rotated-airflow-token" \
   -H "Content-Type: application/json" \
   -d '{"job":"finance_hourly","event":"started","run_id":"dagrun-stuck","external_url":"https://airflow.internal/dags/finance_hourly/grid?dag_run_id=dagrun-stuck","timestamp":"2026-11-03T09:00:00Z"}' >/dev/null
 
 curl -fsS -X POST "http://127.0.0.1:${OBSERR_PORT}/api/v1/events" \
-  -H "Authorization: Bearer secret-airflow-token" \
+  -H "Authorization: Bearer rotated-airflow-token" \
   -H "Content-Type: application/json" \
   -d '{"job":"finance_hourly","event":"started","run_id":"dagrun-next","timestamp":"2026-11-03T10:00:00Z"}' >/dev/null
 
 webhook_count="$(wc -l <"$WEBHOOK_LOG" | tr -d ' ')"
 assert_eq "$webhook_count" "3" "alerte Slack sur Run abandonné"
 
-echo "✅ Smoke test local réussi (binaire obserr serve + SQLite sur disque + 3 webhooks Slack vérifiés)."
+echo "✅ Smoke test local réussi (binaire obserr serve + SQLite sur disque + Schedules/Hot-reload + 3 webhooks Slack vérifiés)."
 
 if [[ "$KEEP_RUNNING" == "true" ]]; then
   echo ""
   echo "🌐 Mode interactif actif :"
   echo "   - Tableau de bord  : http://127.0.0.1:${OBSERR_PORT}/"
   echo "   - Incidents ouverts: http://127.0.0.1:${OBSERR_PORT}/incidents"
-  echo "   - Détail Job résolu: http://127.0.0.1:${OBSERR_PORT}/jobs/dbt-prod/orders_mart"
+  echo "   - Détail Job résolu: http://127.0.0.1:${OBSERR_PORT}/jobs/dbt-prod/compta_nightly"
   echo "   - Webhooks capturés: $WEBHOOK_LOG"
   echo "Appuyez sur Ctrl+C pour arrêter le serveur."
   wait "$SERVER_PID"
