@@ -4,7 +4,34 @@
 
 {% block content %}
 <h1>Job : {{ name }} <small>({{ source }})</small></h1>
-<p>Failed Runs : {{ failed_runs_count }}</p>
+<p>
+  <strong>Statut :</strong> {{ status_label }} |
+  <strong>Schedule :</strong> {{ schedule_summary }} |
+  <strong>Propriétaire :</strong> {{ owner }} |
+  <strong>Tags :</strong> {{ tags }} |
+  <strong>Prochain créneau attendu :</strong> {{ next_slot }}
+</p>
+<p>Failed Runs : {{ failed_runs_count }} | Missed Runs : {{ missed_runs_count }}</p>
+
+{% if !missed_runs.is_empty() %}
+<h2>Missed Runs</h2>
+<table>
+  <thead>
+    <tr>
+      <th>Créneau attendu</th>
+      <th>Détecté à</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for m in missed_runs %}
+    <tr>
+      <td>{{ m.scheduled_for }}</td>
+      <td>{{ m.detected_at }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
 
 <h2>Historique des Incidents</h2>
 {% if incidents.is_empty() %}

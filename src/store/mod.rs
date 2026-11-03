@@ -4,13 +4,20 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::config::Config;
 use crate::domain::{
     CompletedRunOutcome, Incident, IncidentCause, IncidentNotification, IncidentStatus,
-    IncidentTransition, IngestEvent, Job, JobDetails, JobWithLatestRun, OpenIncidentSummary, Run,
-    RunCorrelation, RunStatus, correlate_event, evaluate_incident_transition,
+    IncidentTransition, IngestEvent, Job, JobDetails, JobWithLatestRun, MissedRun,
+    OpenIncidentSummary, Run, RunCorrelation, RunStatus, correlate_event,
+    evaluate_incident_transition, evaluate_missed_run_incident, is_slot_covered_by_runs,
 };
 
 const MIGRATION_0001: &str = include_str!("migrations/0001_initial.sql");
+const MIGRATION_0002: &str = include_str!("migrations/0002_schedules_and_missed_runs.sql");
+
+const SELECT_JOB_COLUMNS: &str = "SELECT id, source, name, schedule_cron, grace_seconds, \
+                                  timezone, owner, tags, schedule_registered_at, \
+                                  last_scheduled_slot, created_at FROM jobs";
 
 const SELECT_RUN_COLUMNS: &str = "SELECT id, job_id, external_run_id, status, started_at, \
                                   finished_at, failed_step, error_excerpt, external_url FROM runs";
@@ -18,8 +25,12 @@ const SELECT_RUN_COLUMNS: &str = "SELECT id, job_id, external_run_id, status, st
 const SELECT_INCIDENT_COLUMNS: &str = "SELECT id, job_id, status, cause, opened_at, \
                                        closed_at, opening_run_id, closing_run_id FROM incidents";
 
+const SELECT_MISSED_RUN_COLUMNS: &str =
+    "SELECT id, job_id, scheduled_for, detected_at FROM missed_runs";
+
 pub struct Store {
     conn: Connection,
+    last_tick_now: Option<DateTime<Utc>>,
 }
 
 impl Store {
@@ -36,21 +47,220 @@ impl Store {
         Self::init(conn)
     }
 
-    /// Configure les pragmas SQLite (`WAL`, `foreign_keys`) et applique le schéma initial.
+    /// Configure les pragmas SQLite (`WAL`, `foreign_keys`) et applique les migrations embarquées.
     fn init(conn: Connection) -> Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL")
             .context("failed to enable WAL mode")?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .context("failed to enable foreign_keys")?;
+
         conn.execute_batch(MIGRATION_0001)
-            .context("failed to run database migrations")?;
-        Ok(Self { conn })
+            .context("failed to run migration 0001")?;
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap_or(0);
+        if version < 2 {
+            let has_schedule_col: bool = conn
+                .prepare("SELECT schedule_cron FROM jobs LIMIT 0")
+                .is_ok();
+            if !has_schedule_col {
+                conn.execute_batch(MIGRATION_0002)
+                    .context("failed to run migration 0002")?;
+            }
+            conn.pragma_update(None, "user_version", 2)
+                .context("failed to update user_version pragma")?;
+        }
+
+        Ok(Self {
+            conn,
+            last_tick_now: None,
+        })
+    }
+
+    /// Retourne le dernier horodatage `now` observé par `tick(now)`.
+    pub fn last_tick_now(&self) -> Option<DateTime<Utc>> {
+        self.last_tick_now
     }
 
     /// Vérifie que la connexion SQLite répond aux requêtes (utilisé par `/health`).
     pub fn ping(&self) -> Result<()> {
         let _: i64 = self.conn.query_row("SELECT 1", [], |row| row.get(0))?;
         Ok(())
+    }
+
+    /// Synchronise en base SQLite les `Jobs` déclarés dans la configuration TOML (création et mise à jour à chaud).
+    pub fn sync_config(
+        &mut self,
+        config: &Config,
+        registered_at: Option<DateTime<Utc>>,
+    ) -> Result<()> {
+        let reg_str = registered_at.as_ref().map(format_ts);
+        let created_ts = registered_at
+            .or(self.last_tick_now)
+            .unwrap_or(DateTime::UNIX_EPOCH);
+        let created_str = format_ts(&created_ts);
+
+        let tx = self.conn.transaction()?;
+        for job_cfg in &config.jobs {
+            let tags_json =
+                serde_json::to_string(&job_cfg.tags).unwrap_or_else(|_| "[]".to_string());
+            let sql_existing =
+                format!("{SELECT_JOB_COLUMNS} WHERE source = ?1 AND name = ?2 LIMIT 1");
+            let existing = tx
+                .query_row(
+                    &sql_existing,
+                    params![job_cfg.source, job_cfg.name],
+                    Self::map_job_row,
+                )
+                .optional()?;
+
+            match existing {
+                None => {
+                    let initial_reg = if job_cfg.schedule_cron.is_some() {
+                        reg_str.clone()
+                    } else {
+                        None
+                    };
+                    tx.execute(
+                        "INSERT INTO jobs (
+                            source, name, schedule_cron, grace_seconds, timezone,
+                            owner, tags, schedule_registered_at, last_scheduled_slot, created_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9)",
+                        params![
+                            job_cfg.source,
+                            job_cfg.name,
+                            job_cfg.schedule_cron,
+                            job_cfg.grace_seconds,
+                            job_cfg.timezone,
+                            job_cfg.owner,
+                            tags_json,
+                            initial_reg,
+                            created_str,
+                        ],
+                    )?;
+                }
+                Some(prev_job) => {
+                    let schedule_changed = prev_job.schedule_cron != job_cfg.schedule_cron
+                        || prev_job.timezone != job_cfg.timezone;
+
+                    let (new_reg_str, new_last_slot_str) = if job_cfg.schedule_cron.is_none() {
+                        (None, None)
+                    } else if schedule_changed {
+                        (reg_str.clone(), None)
+                    } else {
+                        (
+                            prev_job.schedule_registered_at.as_ref().map(format_ts),
+                            prev_job.last_scheduled_slot.as_ref().map(format_ts),
+                        )
+                    };
+
+                    tx.execute(
+                        "UPDATE jobs
+                         SET schedule_cron = ?1,
+                             grace_seconds = ?2,
+                             timezone = ?3,
+                             owner = ?4,
+                             tags = ?5,
+                             schedule_registered_at = ?6,
+                             last_scheduled_slot = ?7
+                         WHERE id = ?8",
+                        params![
+                            job_cfg.schedule_cron,
+                            job_cfg.grace_seconds,
+                            job_cfg.timezone,
+                            job_cfg.owner,
+                            tags_json,
+                            new_reg_str,
+                            new_last_slot_str,
+                            prev_job.id,
+                        ],
+                    )?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Évalue à l'instant `now` tous les `Jobs` dotés d'un `Schedule`, enregistre les `Missed Runs` et ouvre les `Incidents`.
+    pub fn tick(
+        &mut self,
+        now: DateTime<Utc>,
+        default_timezone: &str,
+    ) -> Result<Vec<IncidentNotification>> {
+        self.last_tick_now = Some(now);
+        let now_str = format_ts(&now);
+        let tx = self.conn.transaction()?;
+
+        let sql_jobs = format!("{SELECT_JOB_COLUMNS} ORDER BY id ASC");
+        let jobs = {
+            let mut stmt = tx.prepare(&sql_jobs)?;
+            stmt.query_map([], Self::map_job_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let mut notifications = Vec::new();
+
+        for job in jobs {
+            let Some(schedule) = job.schedule(default_timezone) else {
+                continue;
+            };
+
+            let registered_at = match job.schedule_registered_at {
+                Some(reg) => reg,
+                None => {
+                    tx.execute(
+                        "UPDATE jobs SET schedule_registered_at = ?1 WHERE id = ?2",
+                        params![now_str, job.id],
+                    )?;
+                    now
+                }
+            };
+
+            let due_slots = schedule.due_slots(registered_at, job.last_scheduled_slot, now);
+            if due_slots.is_empty() {
+                continue;
+            }
+
+            let runs = Self::load_all_runs_for_job_in_tx(&tx, job.id)?;
+
+            for slot in due_slots {
+                let slot_str = format_ts(&slot);
+                if !is_slot_covered_by_runs(&runs, slot, schedule.grace_seconds) {
+                    tx.execute(
+                        "INSERT INTO missed_runs (job_id, scheduled_for, detected_at)
+                         VALUES (?1, ?2, ?3)
+                         ON CONFLICT(job_id, scheduled_for) DO NOTHING",
+                        params![job.id, slot_str, now_str],
+                    )?;
+
+                    if tx.changes() > 0 {
+                        let missed_run_id = tx.last_insert_rowid();
+                        let open_incident = Self::load_open_incident(&tx, job.id)?;
+                        let transition =
+                            evaluate_missed_run_incident(open_incident.as_ref(), &job, slot, now);
+                        if let Some(notif) = Self::apply_incident_transition_in_tx(
+                            &tx,
+                            job.id,
+                            &now_str,
+                            Some(missed_run_id),
+                            transition,
+                        )? {
+                            notifications.push(notif);
+                        }
+                    }
+                }
+
+                tx.execute(
+                    "UPDATE jobs SET last_scheduled_slot = ?1 WHERE id = ?2",
+                    params![slot_str, job.id],
+                )?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(notifications)
     }
 
     /// Enregistre de manière transactionnelle un événement `started` ou `finished`, met à jour l'`Incident` éventuel et crée le `Job` si nécessaire.
@@ -192,16 +402,35 @@ impl Store {
             }
         }
 
-        let notification = Self::apply_incident_transition_in_tx(&tx, job_id, &ts_str, transition)?;
+        let notification =
+            Self::apply_incident_transition_in_tx(&tx, job_id, &ts_str, None, transition)?;
         tx.commit()?;
         Ok(notification)
     }
 
-    /// Liste tous les `Jobs` en plaçant ceux ayant un `Incident` ouvert en tête, suivis des autres par `(source, name)`.
-    pub fn list_jobs_with_latest_run(&self) -> Result<Vec<JobWithLatestRun>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, source, name, created_at FROM jobs ORDER BY source ASC, name ASC")?;
+    /// Calcule l'`Incident` ouvert, le fuseau horaire effectif et le prochain créneau attendu d'un `Job` à l'instant `ref_now`.
+    fn compute_job_schedule_view(
+        &self,
+        job: &Job,
+        default_timezone: &str,
+        ref_now: DateTime<Utc>,
+    ) -> Result<(Option<Incident>, String, Option<DateTime<Utc>>)> {
+        let open_incident = Self::load_open_incident(&self.conn, job.id)?;
+        let effective_timezone = job.effective_timezone(default_timezone).to_string();
+        let next_expected_slot = job
+            .schedule(default_timezone)
+            .and_then(|s| s.next_slot_after(ref_now));
+        Ok((open_incident, effective_timezone, next_expected_slot))
+    }
+
+    /// Liste tous les `Jobs` triés par statut (`Incident ouvert`, puis `OK`, puis `Sans Schedule`) et par `(source, name)`.
+    pub fn list_jobs_with_latest_run(
+        &self,
+        default_timezone: &str,
+        ref_now: DateTime<Utc>,
+    ) -> Result<Vec<JobWithLatestRun>> {
+        let sql = format!("{SELECT_JOB_COLUMNS} ORDER BY source ASC, name ASC");
+        let mut stmt = self.conn.prepare(&sql)?;
         let jobs_iter = stmt.query_map([], Self::map_job_row)?;
 
         let sql_latest = format!("{SELECT_RUN_COLUMNS} WHERE job_id = ?1 ORDER BY id DESC LIMIT 1");
@@ -212,18 +441,21 @@ impl Store {
                 .conn
                 .query_row(&sql_latest, params![job.id], Self::map_run_row)
                 .optional()?;
-            let open_incident = Self::load_open_incident(&self.conn, job.id)?;
+            let (open_incident, effective_timezone, next_expected_slot) =
+                self.compute_job_schedule_view(&job, default_timezone, ref_now)?;
+
             results.push(JobWithLatestRun {
                 job,
                 latest_run,
                 open_incident,
+                effective_timezone,
+                next_expected_slot,
             });
         }
 
         results.sort_by(|a, b| {
-            b.open_incident
-                .is_some()
-                .cmp(&a.open_incident.is_some())
+            a.sort_rank()
+                .cmp(&b.sort_rank())
                 .then_with(|| a.job.source.cmp(&b.job.source))
                 .then_with(|| a.job.name.cmp(&b.job.name))
         });
@@ -231,25 +463,39 @@ impl Store {
         Ok(results)
     }
 
-    /// Récupère un `Job` par `(source, name)` ainsi que l'historique de ses `Runs` et de ses `Incidents`.
-    pub fn get_job_details(&self, source: &str, name: &str) -> Result<Option<JobDetails>> {
+    /// Récupère un `Job` par `(source, name)` ainsi que ses métadonnées, son prochain créneau et son historique.
+    pub fn get_job_details(
+        &self,
+        source: &str,
+        name: &str,
+        default_timezone: &str,
+        ref_now: DateTime<Utc>,
+    ) -> Result<Option<JobDetails>> {
+        let sql_job = format!("{SELECT_JOB_COLUMNS} WHERE source = ?1 AND name = ?2");
         let job_opt = self
             .conn
-            .query_row(
-                "SELECT id, source, name, created_at FROM jobs WHERE source = ?1 AND name = ?2",
-                params![source, name],
-                Self::map_job_row,
-            )
+            .query_row(&sql_job, params![source, name], Self::map_job_row)
             .optional()?;
 
         let Some(job) = job_opt else {
             return Ok(None);
         };
 
+        let (open_incident, effective_timezone, next_expected_slot) =
+            self.compute_job_schedule_view(&job, default_timezone, ref_now)?;
+
         let sql_runs = format!("{SELECT_RUN_COLUMNS} WHERE job_id = ?1 ORDER BY id DESC");
         let mut stmt_runs = self.conn.prepare(&sql_runs)?;
         let runs = stmt_runs
             .query_map(params![job.id], Self::map_run_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let sql_missed = format!(
+            "{SELECT_MISSED_RUN_COLUMNS} WHERE job_id = ?1 ORDER BY scheduled_for DESC, id DESC"
+        );
+        let mut stmt_missed = self.conn.prepare(&sql_missed)?;
+        let missed_runs = stmt_missed
+            .query_map(params![job.id], Self::map_missed_run_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let sql_incidents = format!("{SELECT_INCIDENT_COLUMNS} WHERE job_id = ?1 ORDER BY id DESC");
@@ -260,42 +506,65 @@ impl Store {
 
         Ok(Some(JobDetails {
             job,
+            open_incident,
+            effective_timezone,
+            next_expected_slot,
             runs,
+            missed_runs,
             incidents,
         }))
     }
 
     /// Liste tous les `Incidents` actuellement au statut `open` avec le dernier extrait d'erreur et le lien vers la `Source`.
     pub fn list_open_incidents(&self) -> Result<Vec<OpenIncidentSummary>> {
-        let sql = format!("{SELECT_INCIDENT_COLUMNS} WHERE status = 'open' ORDER BY opened_at ASC, id ASC");
+        let sql = format!(
+            "{SELECT_INCIDENT_COLUMNS} WHERE status = 'open' ORDER BY opened_at ASC, id ASC"
+        );
         let mut stmt = self.conn.prepare(&sql)?;
         let incidents_iter = stmt.query_map([], Self::map_incident_row)?;
 
+        let sql_job = format!("{SELECT_JOB_COLUMNS} WHERE id = ?1");
         let sql_failed_runs = format!(
-            "{SELECT_RUN_COLUMNS} WHERE job_id = ?1 AND id >= COALESCE(?2, 0) \
+            "{SELECT_RUN_COLUMNS} WHERE job_id = ?1 \
+             AND COALESCE(finished_at, started_at) >= ?2 \
+             AND (?3 IS NULL OR id >= ?3) \
              AND status IN ('failed', 'abandoned') ORDER BY id DESC"
         );
+        let sql_latest_missed =
+            format!("{SELECT_MISSED_RUN_COLUMNS} WHERE job_id = ?1 ORDER BY id DESC LIMIT 1");
 
         let mut summaries = Vec::new();
         for inc_res in incidents_iter {
             let incident = inc_res?;
-            let job = self.conn.query_row(
-                "SELECT id, source, name, created_at FROM jobs WHERE id = ?1",
-                params![incident.job_id],
-                Self::map_job_row,
-            )?;
+            let job = self
+                .conn
+                .query_row(&sql_job, params![incident.job_id], Self::map_job_row)?;
 
+            let opened_str = format_ts(&incident.opened_at);
             let mut stmt_runs = self.conn.prepare(&sql_failed_runs)?;
             let failed_runs = stmt_runs
-                .query_map(params![job.id, incident.opening_run_id], Self::map_run_row)?
+                .query_map(
+                    params![job.id, opened_str, incident.opening_run_id],
+                    Self::map_run_row,
+                )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
 
-            let latest_error_excerpt = failed_runs
+            let mut latest_error_excerpt = failed_runs
                 .iter()
                 .find_map(|r| r.error_excerpt.clone().filter(|s| !s.is_empty()));
             let external_url = failed_runs
                 .iter()
                 .find_map(|r| r.external_url.clone().filter(|s| !s.is_empty()));
+
+            if latest_error_excerpt.is_none() && incident.cause == IncidentCause::MissedRun {
+                if let Some(missed) = self
+                    .conn
+                    .query_row(&sql_latest_missed, params![job.id], Self::map_missed_run_row)
+                    .optional()?
+                {
+                    latest_error_excerpt = Some(missed.summary_text());
+                }
+            }
 
             summaries.push(OpenIncidentSummary {
                 incident,
@@ -308,9 +577,20 @@ impl Store {
         Ok(summaries)
     }
 
+    /// Charge tous les `Runs` d'un `Job` dans une transaction pour vérifier la couverture des créneaux de `Schedule`.
+    fn load_all_runs_for_job_in_tx(tx: &rusqlite::Transaction<'_>, job_id: i64) -> Result<Vec<Run>> {
+        let sql = format!("{SELECT_RUN_COLUMNS} WHERE job_id = ?1 ORDER BY id ASC");
+        let mut stmt = tx.prepare(&sql)?;
+        let runs = stmt
+            .query_map(params![job_id], Self::map_run_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(runs)
+    }
+
     /// Charge tous les `Runs` actuellement au statut `running` pour un `Job` donné dans une transaction.
     fn load_running_runs_in_tx(tx: &rusqlite::Transaction<'_>, job_id: i64) -> Result<Vec<Run>> {
-        let sql = format!("{SELECT_RUN_COLUMNS} WHERE job_id = ?1 AND status = 'running' ORDER BY id ASC");
+        let sql =
+            format!("{SELECT_RUN_COLUMNS} WHERE job_id = ?1 AND status = 'running' ORDER BY id ASC");
         let mut stmt = tx.prepare(&sql)?;
         let runs = stmt
             .query_map(params![job_id], Self::map_run_row)?
@@ -323,6 +603,7 @@ impl Store {
         tx: &rusqlite::Transaction<'_>,
         job_id: i64,
         ts_str: &str,
+        opening_missed_run_id: Option<i64>,
         transition: IncidentTransition,
     ) -> Result<Option<IncidentNotification>> {
         match transition {
@@ -333,14 +614,16 @@ impl Store {
                 notification,
             } => {
                 tx.execute(
-                    "INSERT INTO incidents (job_id, status, cause, opened_at, opening_run_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT INTO incidents (
+                        job_id, status, cause, opened_at, opening_run_id, opening_missed_run_id
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         job_id,
                         IncidentStatus::Open.as_str(),
                         cause.as_db_str(),
                         ts_str,
-                        opening_run_id
+                        opening_run_id,
+                        opening_missed_run_id,
                     ],
                 )?;
                 Ok(Some(notification))
@@ -395,11 +678,26 @@ impl Store {
     }
 
     fn map_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
-        let created_str: String = row.get(3)?;
+        let tags_raw: Option<String> = row.get(7)?;
+        let tags: Vec<String> = tags_raw
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        let reg_str: Option<String> = row.get(8)?;
+        let last_slot_str: Option<String> = row.get(9)?;
+        let created_str: String = row.get(10)?;
+
         Ok(Job {
             id: row.get(0)?,
             source: row.get(1)?,
             name: row.get(2)?,
+            schedule_cron: row.get(3)?,
+            grace_seconds: row.get(4)?,
+            timezone: row.get(5)?,
+            owner: row.get(6)?,
+            tags,
+            schedule_registered_at: reg_str.as_deref().map(parse_ts),
+            last_scheduled_slot: last_slot_str.as_deref().map(parse_ts),
             created_at: parse_ts(&created_str),
         })
     }
@@ -418,6 +716,17 @@ impl Store {
             failed_step: row.get(6)?,
             error_excerpt: row.get(7)?,
             external_url: row.get(8)?,
+        })
+    }
+
+    fn map_missed_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MissedRun> {
+        let sched_str: String = row.get(2)?;
+        let detected_str: String = row.get(3)?;
+        Ok(MissedRun {
+            id: row.get(0)?,
+            job_id: row.get(1)?,
+            scheduled_for: parse_ts(&sched_str),
+            detected_at: parse_ts(&detected_str),
         })
     }
 }

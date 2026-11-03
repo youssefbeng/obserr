@@ -884,6 +884,779 @@ token = "secret-dbt-token"
     assert_eq!(memory_channel.recorded().len(), 1);
 }
 
+#[tokio::test]
+async fn predeclared_jobs_in_toml_appear_immediately_with_status_metadata_and_next_slot() {
+    let config = Config::from_toml_str(
+        r#"
+[server]
+timezone = "UTC"
+
+[sources.dbt-prod]
+token = "secret-dbt-token"
+
+[sources.airflow-prod]
+token = "secret-airflow-token"
+
+[jobs.dbt-prod.compta_nightly]
+schedule = "0 2 * * *"
+grace = "30m"
+timezone = "Europe/Paris"
+owner = "equipe-finance"
+tags = ["finance", "nightly"]
+
+[jobs.airflow-prod.adhoc_import]
+owner = "equipe-data"
+tags = ["adhoc"]
+"#,
+    )
+    .expect("valid TOML config with predeclared jobs");
+
+    let store = Store::open_in_memory().expect("in-memory SQLite store");
+    let state = AppState::new(config, store);
+
+    // Fix reference clock to 2026-11-03T00:00:00Z (winter time in Europe/Paris: CET = UTC+1, so 02:00 Europe/Paris = 01:00:00Z)
+    state
+        .tick("2026-11-03T00:00:00Z".parse().unwrap())
+        .await
+        .expect("initial tick succeeds");
+
+    let app = web::router(state);
+
+    // 1. Dashboard (`GET /`) immediately lists both predeclared Jobs before any HTTP event
+    let dash_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dash_res.status(), StatusCode::OK);
+    let dash_html = body_string(dash_res).await;
+
+    assert!(dash_html.contains("compta_nightly"));
+    assert!(dash_html.contains("OK"));
+    assert!(dash_html.contains("0 2 * * *"));
+    assert!(dash_html.contains("equipe-finance"));
+    assert!(dash_html.contains("finance"));
+    assert!(dash_html.contains("nightly"));
+    assert!(
+        dash_html.contains("2026-11-03T01:00:00Z"),
+        "next expected slot for 02:00 Europe/Paris on 2026-11-03 (CET, UTC+1) must be 2026-11-03T01:00:00Z: {dash_html}"
+    );
+
+    assert!(dash_html.contains("adhoc_import"));
+    assert!(dash_html.contains("Sans Schedule"));
+    assert!(dash_html.contains("equipe-data"));
+    assert!(dash_html.contains("adhoc"));
+
+    // Scheduled `OK` job appears before `Sans Schedule` job on the Dashboard
+    let pos_ok = dash_html.find("compta_nightly").unwrap();
+    let pos_unscheduled = dash_html.find("adhoc_import").unwrap();
+    assert!(
+        pos_ok < pos_unscheduled,
+        "Job with status OK must appear before Job with status Sans Schedule"
+    );
+
+    // 2. Job detail page (`GET /jobs/dbt-prod/compta_nightly`) shows status, Schedule, owner, tags, and next expected slot
+    let detail_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/jobs/dbt-prod/compta_nightly")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_res.status(), StatusCode::OK);
+    let detail_html = body_string(detail_res).await;
+    assert!(detail_html.contains("OK"));
+    assert!(detail_html.contains("0 2 * * *"));
+    assert!(detail_html.contains("30m") || detail_html.contains("1800s"));
+    assert!(detail_html.contains("Europe/Paris"));
+    assert!(detail_html.contains("equipe-finance"));
+    assert!(detail_html.contains("finance"));
+    assert!(detail_html.contains("nightly"));
+    assert!(detail_html.contains("2026-11-03T01:00:00Z"));
+
+    // 3. Job detail page for unscheduled job (`GET /jobs/airflow-prod/adhoc_import`) shows `Sans Schedule`
+    let unsched_res = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/jobs/airflow-prod/adhoc_import")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unsched_res.status(), StatusCode::OK);
+    let unsched_html = body_string(unsched_res).await;
+    assert!(unsched_html.contains("Sans Schedule"));
+    assert!(unsched_html.contains("equipe-data"));
+    assert!(unsched_html.contains("adhoc"));
+}
+
+#[tokio::test]
+async fn tick_respects_grace_period_and_declares_single_missed_run_unless_covered_by_started_or_finished_run() {
+    let config = Config::from_toml_str(
+        r#"
+[sources.dbt-prod]
+token = "secret-dbt-token"
+
+[jobs.dbt-prod.hourly_kpi]
+schedule = "0 * * * *"
+grace = "15m"
+"#,
+    )
+    .expect("valid TOML config");
+
+    let store = Store::open_in_memory().expect("in-memory SQLite store");
+    let state = AppState::new(config, store);
+    let app = web::router(state.clone());
+
+    // Anchor schedule at 09:50:00Z (before the 10:00:00Z slot)
+    let alerts_init = state
+        .tick("2026-11-03T09:50:00Z".parse().unwrap())
+        .await
+        .unwrap();
+    assert!(alerts_init.is_empty());
+
+    // 1. Slot 10:00:00Z: while now < 10:00 + 15m (at 10:14:59Z), NO Missed Run is declared
+    let alerts_before_grace = state
+        .tick("2026-11-03T10:14:59Z".parse().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        alerts_before_grace.is_empty(),
+        "no Missed Run should be declared while now < slot + grace"
+    );
+
+    let detail_before = body_string(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/jobs/dbt-prod/hourly_kpi")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(detail_before.contains("Missed Runs : 0"));
+
+    // 2. Slot 10:00:00Z: as soon as now >= 10:00 + 15m (at 10:15:00Z) with no Run in [10:00, 10:15],
+    //    exactly 1 Missed Run is recorded for 2026-11-03T10:00:00Z.
+    let alerts_at_grace = state
+        .tick("2026-11-03T10:15:00Z".parse().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(alerts_at_grace.len(), 1);
+
+    // Calling tick again at 10:20:00Z is idempotent (still 1 Missed Run for the 10:00:00Z slot)
+    let alerts_repeat = state
+        .tick("2026-11-03T10:20:00Z".parse().unwrap())
+        .await
+        .unwrap();
+    assert!(alerts_repeat.is_empty());
+
+    let detail_after_miss = body_string(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/jobs/dbt-prod/hourly_kpi")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(detail_after_miss.contains("Missed Runs : 1"));
+    assert!(detail_after_miss.contains("2026-11-03T10:00:00Z"));
+
+    // 3. Slot 11:00:00Z: a Run starts at 11:10:00Z (within [11:00, 11:15]) -> NO Missed Run at 11:20:00Z
+    let start_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/events")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer secret-dbt-token")
+                .body(Body::from(
+                    r#"{
+                        "job": "hourly_kpi",
+                        "event": "started",
+                        "run_id": "run-11h",
+                        "timestamp": "2026-11-03T11:10:00Z"
+                    }"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(start_res.status(), StatusCode::OK);
+
+    let finish_11h = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/events")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer secret-dbt-token")
+                .body(Body::from(
+                    r#"{
+                        "job": "hourly_kpi",
+                        "event": "finished",
+                        "run_id": "run-11h",
+                        "status": "succeeded",
+                        "timestamp": "2026-11-03T11:18:00Z"
+                    }"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(finish_11h.status(), StatusCode::OK);
+
+    let alerts_11h = state
+        .tick("2026-11-03T11:20:00Z".parse().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        alerts_11h.is_empty(),
+        "Run started in [11:00, 11:15] must cover the 11:00 slot"
+    );
+
+    // 4. Slot 12:00:00Z: a callback-only Run (`finished` without `started_at`) at 12:12:00Z (within [12:00, 12:15]) -> NO Missed Run at 12:20:00Z
+    let finish_only_12h = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/events")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer secret-dbt-token")
+                .body(Body::from(
+                    r#"{
+                        "job": "hourly_kpi",
+                        "event": "finished",
+                        "status": "succeeded",
+                        "timestamp": "2026-11-03T12:12:00Z"
+                    }"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(finish_only_12h.status(), StatusCode::OK);
+
+    let alerts_12h = state
+        .tick("2026-11-03T12:20:00Z".parse().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        alerts_12h.is_empty(),
+        "finished-only Run in [12:00, 12:15] must cover the 12:00 slot"
+    );
+
+    let detail_final = body_string(
+        app.oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/jobs/dbt-prod/hourly_kpi")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(
+        detail_final.contains("Missed Runs : 1"),
+        "still only 1 Missed Run after covered 11:00 and 12:00 slots"
+    );
+}
+
+#[tokio::test]
+async fn tick_evaluates_schedule_in_job_or_global_timezone_including_summer_winter_dst_transitions() {
+    // Global timezone is Europe/Paris; one Job uses global Europe/Paris (08:00 local),
+    // another Job overrides timezone with UTC (08:00 UTC).
+    let config = Config::from_toml_str(
+        r#"
+[server]
+timezone = "Europe/Paris"
+
+[sources.dbt-prod]
+token = "secret-dbt-token"
+
+[jobs.dbt-prod.paris_morning]
+schedule = "0 8 * * *"
+grace = "10m"
+
+[jobs.dbt-prod.utc_morning]
+schedule = "0 8 * * *"
+grace = "10m"
+timezone = "UTC"
+"#,
+    )
+    .expect("valid TOML config");
+
+    let store = Store::open_in_memory().expect("in-memory SQLite store");
+    let state = AppState::new(config, store);
+    let app = web::router(state.clone());
+
+    // 1. Summer time (CEST = UTC+2) on 2026-10-24 (day before autumn DST switch):
+    //    `paris_morning` (08:00 Europe/Paris) is expected at 2026-10-24T06:00:00Z (grace ends at 06:10:00Z).
+    //    `utc_morning` (08:00 UTC) is expected at 2026-10-24T08:00:00Z.
+    state
+        .tick("2026-10-24T05:50:00Z".parse().unwrap())
+        .await
+        .unwrap();
+
+    // At 06:09:00Z, neither job has missed its slot yet
+    assert!(
+        state
+            .tick("2026-10-24T06:09:00Z".parse().unwrap())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // At 06:10:00Z, `paris_morning` misses its 08:00 CEST (06:00 UTC) slot, while `utc_morning` is not due until 08:00 UTC
+    let summer_alerts = state
+        .tick("2026-10-24T06:10:00Z".parse().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(summer_alerts.len(), 1);
+
+    // Cover `utc_morning` at 08:05:00Z on 2026-10-24 so it does not miss
+    let cover_utc = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/events")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer secret-dbt-token")
+                .body(Body::from(
+                    r#"{
+                        "job": "utc_morning",
+                        "event": "finished",
+                        "status": "succeeded",
+                        "timestamp": "2026-10-24T08:05:00Z"
+                    }"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cover_utc.status(), StatusCode::OK);
+    assert!(
+        state
+            .tick("2026-10-24T08:15:00Z".parse().unwrap())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // 2. Winter time (CET = UTC+1) on 2026-10-25 (autumn DST transition happens at 01:00 UTC on 2026-10-25):
+    //    `paris_morning` (08:00 Europe/Paris) is now expected at 2026-10-25T07:00:00Z (NOT 06:00:00Z!).
+    //    At 2026-10-25T06:30:00Z, `paris_morning` must NOT have a Missed Run for 2026-10-25 yet.
+    state
+        .tick("2026-10-25T06:30:00Z".parse().unwrap())
+        .await
+        .unwrap();
+    let paris_detail_before_winter_slot = body_string(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/jobs/dbt-prod/paris_morning")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        paris_detail_before_winter_slot.contains("Missed Runs : 1"),
+        "at 06:30 UTC on winter-time day, 08:00 CET (07:00 UTC) has not occurred yet"
+    );
+
+    // At 2026-10-25T07:10:00Z (08:00 CET + 10m grace), the second Missed Run is recorded for 2026-10-25T07:00:00Z!
+    state
+        .tick("2026-10-25T07:10:00Z".parse().unwrap())
+        .await
+        .unwrap();
+    let paris_detail_after_winter_slot = body_string(
+        app.oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/jobs/dbt-prod/paris_morning")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(paris_detail_after_winter_slot.contains("Missed Runs : 2"));
+    assert!(paris_detail_after_winter_slot.contains("2026-10-24T06:00:00Z"));
+    assert!(paris_detail_after_winter_slot.contains("2026-10-25T07:00:00Z"));
+}
+
+#[tokio::test]
+async fn missed_run_opens_incident_sends_single_slack_alert_and_resolves_on_next_succeeded_run() {
+    let (webhook_url, slack_messages) = spawn_slack_webhook_receiver().await;
+    let toml = format!(
+        r#"
+[server]
+public_url = "https://obserr.internal"
+
+[channel]
+webhook_url = "{webhook_url}"
+
+[sources.airflow-prod]
+token = "secret-airflow-token"
+
+[jobs.airflow-prod.revenue_daily]
+schedule = "0 * * * *"
+grace = "15m"
+"#
+    );
+    let config = Config::from_toml_str(&toml).expect("valid TOML");
+    let store = Store::open_in_memory().expect("in-memory SQLite store");
+    let state = AppState::new(config, store);
+    let app = web::router(state.clone());
+
+    // Anchor at 09:50:00Z
+    state
+        .tick("2026-11-03T09:50:00Z".parse().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(slack_messages.lock().unwrap().len(), 0);
+
+    // 0. Earlier Failed Run at 09:52:00Z followed by recovery at 09:55:00Z (opens & closes a prior Incident)
+    let _ = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/events")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer secret-airflow-token")
+                .body(Body::from(
+                    r#"{
+                        "job": "revenue_daily",
+                        "event": "finished",
+                        "run_id": "old-fail",
+                        "status": "failed",
+                        "error_excerpt": "stale error from closed incident",
+                        "timestamp": "2026-11-03T09:52:00Z"
+                    }"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let _ = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/events")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer secret-airflow-token")
+                .body(Body::from(
+                    r#"{
+                        "job": "revenue_daily",
+                        "event": "finished",
+                        "run_id": "old-recover",
+                        "status": "succeeded",
+                        "timestamp": "2026-11-03T09:55:00Z"
+                    }"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    slack_messages.lock().unwrap().clear();
+
+    // 1. First Missed Run at 10:15:00Z (for 10:00:00Z slot) opens an Incident and sends 1 Slack alert
+    state
+        .tick("2026-11-03T10:15:00Z".parse().unwrap())
+        .await
+        .unwrap();
+
+    let messages = slack_messages.lock().unwrap().clone();
+    assert_eq!(messages.len(), 1, "Missed Run must send 1 Slack opening alert");
+    let open_text = messages[0]["text"].as_str().unwrap();
+    assert!(open_text.contains("revenue_daily"));
+    assert!(open_text.contains("airflow-prod"));
+    assert!(open_text.contains("Missed Run"));
+    assert!(open_text.contains("2026-11-03T10:15:00Z"));
+    assert!(open_text.contains("https://obserr.internal/jobs/airflow-prod/revenue_daily"));
+
+    // 2. Dashboard and /incidents show the open Incident caused by Missed Run
+    let dash_html = body_string(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(dash_html.contains("Incident ouvert"));
+
+    let inc_html = body_string(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/incidents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(inc_html.contains("revenue_daily"));
+    assert!(inc_html.contains("Missed Run"));
+    assert!(
+        !inc_html.contains("stale error from closed incident"),
+        "open Missed Run incident must not display stale error excerpts from prior closed incidents"
+    );
+
+    // 3. Second consecutive Missed Run at 11:15:00Z (for 11:00:00Z slot) while Incident is already open:
+    //    recorded in history, but sends 0 additional Slack alerts!
+    state
+        .tick("2026-11-03T11:15:00Z".parse().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        slack_messages.lock().unwrap().len(),
+        1,
+        "subsequent Missed Run on an already-open Incident must not send extra Slack alerts"
+    );
+
+    // 4. Subsequent succeeded Run at 11:30:00Z (75m = 4500s after Incident opened at 10:15:00Z)
+    //    closes the Incident and sends 1 Slack resolution alert
+    let recovery_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/events")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer secret-airflow-token")
+                .body(Body::from(
+                    r#"{
+                        "job": "revenue_daily",
+                        "event": "finished",
+                        "run_id": "dagrun-ok",
+                        "status": "succeeded",
+                        "timestamp": "2026-11-03T11:30:00Z"
+                    }"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovery_res.status(), StatusCode::OK);
+
+    let messages_after = slack_messages.lock().unwrap().clone();
+    assert_eq!(messages_after.len(), 2, "expected 1 opening alert + 1 resolution alert");
+    let resolved_text = messages_after[1]["text"].as_str().unwrap();
+    assert!(resolved_text.contains("✅ Résolu"));
+    assert!(resolved_text.contains("revenue_daily"));
+    assert!(resolved_text.contains("4500s") || resolved_text.contains("1h 15m"));
+
+    // Dashboard now shows status `OK` again
+    let dash_after = body_string(
+        app.oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(!dash_after.contains("Incident ouvert"));
+    assert!(dash_after.contains("OK"));
+}
+
+#[tokio::test]
+async fn no_retroactive_missed_runs_before_schedule_registration_and_hot_reload_updates_live_server() {
+    let (webhook_url_1, slack_1) = spawn_slack_webhook_receiver().await;
+    let (webhook_url_2, slack_2) = spawn_slack_webhook_receiver().await;
+
+    let tmp_dir = std::env::temp_dir().join(format!("obserr-test-hotreload-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let config_path = tmp_dir.join("obserr.toml");
+
+    // Initial TOML: `unscheduled_job` has NO schedule; `scheduled_job` is hourly
+    let initial_toml = format!(
+        r#"
+[server]
+public_url = "https://obserr.internal"
+
+[channel]
+webhook_url = "{webhook_url_1}"
+
+[sources.dbt-prod]
+token = "initial-dbt-token"
+
+[jobs.dbt-prod.unscheduled_job]
+owner = "alice"
+tags = ["v1"]
+"#
+    );
+    std::fs::write(&config_path, &initial_toml).unwrap();
+
+    let store = Store::open_in_memory().expect("in-memory SQLite store");
+    let state = AppState::from_config_file(&config_path, store).expect("load state from file");
+    let app = web::router(state.clone());
+
+    // 1. Initial tick at 08:00:00Z: `unscheduled_job` has no schedule and never generates a Missed Run
+    state
+        .tick("2026-11-03T08:00:00Z".parse().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(slack_1.lock().unwrap().len(), 0);
+
+    // 2. Modify TOML on disk at 10:15:00Z (hot-reload!):
+    //    - Add a Schedule (`0 * * * *`, grace `10m`) to `unscheduled_job`
+    //    - Update `owner` ("bob") and `tags` (["v2", "hot-reloaded"])
+    //    - Rotate `dbt-prod` token to `"rotated-dbt-token"`
+    //    - Update Slack `webhook_url` to `webhook_url_2`
+    let updated_toml = format!(
+        r#"
+[server]
+public_url = "https://obserr.internal"
+
+[channel]
+webhook_url = "{webhook_url_2}"
+
+[sources.dbt-prod]
+token = "rotated-dbt-token"
+
+[jobs.dbt-prod.unscheduled_job]
+schedule = "0 * * * *"
+grace = "10m"
+owner = "bob"
+tags = ["v2", "hot-reloaded"]
+"#
+    );
+    std::fs::write(&config_path, &updated_toml).unwrap();
+
+    // 3. Tick at 10:15:00Z (when the Schedule is registered):
+    //    Slots prior to 10:15:00Z (such as 08:00Z, 09:00Z, and 10:00Z!) must NOT trigger a retroactive Missed Run!
+    let retroactive_alerts = state
+        .tick("2026-11-03T10:15:00Z".parse().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        retroactive_alerts.is_empty(),
+        "no retroactive Missed Run may fire for slots prior to Schedule registration at 10:15:00Z"
+    );
+
+    // 4. Dashboard immediately reflects the hot-reloaded Schedule, owner, and tags
+    let dash_html = body_string(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(dash_html.contains("OK"));
+    assert!(dash_html.contains("0 * * * *"));
+    assert!(dash_html.contains("bob"));
+    assert!(dash_html.contains("v2, hot-reloaded"));
+    assert!(dash_html.contains("2026-11-03T11:00:00Z"));
+
+    // 5. Old Source token is now rejected (`401`) and rotated token is accepted (`200`)
+    let old_token_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/events")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer initial-dbt-token")
+                .body(Body::from(r#"{"job":"other_job","event":"started"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(old_token_res.status(), StatusCode::UNAUTHORIZED);
+
+    let new_token_res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/events")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer rotated-dbt-token")
+                .body(Body::from(
+                    r#"{"job":"other_job","event":"started","run_id":"r1","timestamp":"2026-11-03T10:20:00Z"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(new_token_res.status(), StatusCode::OK);
+
+    // 6. At 11:10:00Z (first slot `11:00:00Z` after registration + 10m grace),
+    //    `unscheduled_job` misses its 11:00:00Z slot and sends the alert to the NEW Slack webhook URL (`slack_2`)!
+    let alerts_11h = state
+        .tick("2026-11-03T11:10:00Z".parse().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(alerts_11h.len(), 1);
+    assert_eq!(
+        slack_1.lock().unwrap().len(),
+        0,
+        "old Slack webhook URL must not receive alerts after hot-reload"
+    );
+    assert_eq!(
+        slack_2.lock().unwrap().len(),
+        1,
+        "new Slack webhook URL must receive the alert after hot-reload"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+
+
+
 
 
 
