@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+
+{% block title %}Incidents ouverts — obserr{% endblock %}
+
+{% block content %}
+<h1>Incidents ouverts</h1>
+{% if incidents.is_empty() %}
+  <p>Aucun Incident ouvert actuellement.</p>
+{% else %}
+  <table>
+    <thead>
+      <tr>
+        <th>Job</th>
+        <th>Source</th>
+        <th>Statut</th>
+        <th>Ouvert à</th>
+        <th>Cause initiale</th>
+        <th>Lien Source</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for inc in incidents %}
+      <tr>
+        <td><a href="/jobs/{{ inc.source }}/{{ inc.job_name }}">{{ inc.job_name }}</a></td>
+        <td>{{ inc.source }}</td>
+        <td>{{ inc.status }}</td>
+        <td>{{ inc.opened_at }}</td>
+        <td>{{ inc.cause }}</td>
+        <td>
+          {% if !inc.external_url.is_empty() %}
+            <a href="{{ inc.external_url }}" target="_blank" rel="noopener">Voir dans {{ inc.source }}</a>
+          {% else %}
+            -
+          {% endif %}
+        </td>
+      </tr>
+      {% if !inc.latest_error_excerpt.is_empty() %}
+      <tr>
+        <td colspan="6">
+          <pre>{{ inc.latest_error_excerpt }}</pre>
+        </td>
+      </tr>
+      {% endif %}
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+{% endblock %}

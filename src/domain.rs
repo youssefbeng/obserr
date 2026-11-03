@@ -75,10 +75,199 @@ impl Run {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IncidentStatus {
+    Open,
+    Closed,
+}
+
+impl IncidentStatus {
+    /// Retourne la représentation textuelle canonique du statut d'un `Incident`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+        }
+    }
+
+    /// Reconstruit un `IncidentStatus` depuis la valeur stockée en base SQLite.
+    pub fn from_db(value: &str) -> Self {
+        match value {
+            "closed" => Self::Closed,
+            _ => Self::Open,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IncidentCause {
+    FailedRun,
+    AbandonedRun,
+}
+
+impl IncidentCause {
+    /// Retourne le code stocké en base SQLite pour la cause initiale d'un `Incident`.
+    pub fn as_db_str(&self) -> &'static str {
+        match self {
+            Self::FailedRun => "failed_run",
+            Self::AbandonedRun => "abandoned_run",
+        }
+    }
+
+    /// Reconstruit un `IncidentCause` depuis la valeur stockée en base SQLite.
+    pub fn from_db(value: &str) -> Self {
+        match value {
+            "abandoned_run" => Self::AbandonedRun,
+            _ => Self::FailedRun,
+        }
+    }
+
+    /// Retourne le libellé métier affiché dans l'UI et les alertes de `Channel`.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::FailedRun => "Failed Run (failed)",
+            Self::AbandonedRun => "Failed Run (abandoned — Run abandonné)",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Incident {
+    pub id: i64,
+    pub job_id: i64,
+    pub status: IncidentStatus,
+    pub cause: IncidentCause,
+    pub opened_at: DateTime<Utc>,
+    pub closed_at: Option<DateTime<Utc>>,
+    pub opening_run_id: Option<i64>,
+    pub closing_run_id: Option<i64>,
+}
+
+impl Incident {
+    /// Calcule la durée totale de l'`Incident` en secondes lorsqu'il est fermé.
+    pub fn duration_seconds(&self) -> Option<i64> {
+        let closed = self.closed_at?;
+        Some((closed - self.opened_at).num_seconds().max(0))
+    }
+}
+
+/// Notification métier émise par le moteur d'`Incidents` à destination d'un `Channel`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IncidentNotification {
+    Opened {
+        source: Source,
+        job_name: String,
+        cause: IncidentCause,
+        opened_at: DateTime<Utc>,
+        failed_step: Option<Step>,
+        error_excerpt: Option<String>,
+        external_url: Option<String>,
+    },
+    Resolved {
+        source: Source,
+        job_name: String,
+        opened_at: DateTime<Utc>,
+        closed_at: DateTime<Utc>,
+        duration_seconds: i64,
+    },
+}
+
+/// Transition d'état d'un `Incident` décidée par le cœur métier (`ADR-0005`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IncidentTransition {
+    None,
+    Open {
+        cause: IncidentCause,
+        opening_run_id: i64,
+        notification: IncidentNotification,
+    },
+    Close {
+        incident_id: i64,
+        closing_run_id: i64,
+        notification: IncidentNotification,
+    },
+}
+
+/// Contexte d'un `Run` terminé transmis au moteur d'évaluation des `Incidents`.
+#[derive(Debug, Clone)]
+pub struct CompletedRunOutcome {
+    pub run_id: i64,
+    pub status: RunStatus,
+    pub failed_step: Option<Step>,
+    pub error_excerpt: Option<String>,
+    pub external_url: Option<String>,
+}
+
+/// Évalue la transition d'`Incident` provoquée par un `Run` terminé (`Failed Run` ou `succeeded`).
+pub fn evaluate_incident_transition(
+    open_incident: Option<&Incident>,
+    event: &IngestEvent,
+    completed: CompletedRunOutcome,
+) -> IncidentTransition {
+    if completed.status.is_failed_run() {
+        if open_incident.is_none() {
+            let cause = match completed.status {
+                RunStatus::Abandoned => IncidentCause::AbandonedRun,
+                _ => IncidentCause::FailedRun,
+            };
+            return IncidentTransition::Open {
+                cause,
+                opening_run_id: completed.run_id,
+                notification: IncidentNotification::Opened {
+                    source: event.source.clone(),
+                    job_name: event.job_name.clone(),
+                    cause,
+                    opened_at: event.timestamp,
+                    failed_step: completed.failed_step,
+                    error_excerpt: completed.error_excerpt,
+                    external_url: completed.external_url,
+                },
+            };
+        }
+        return IncidentTransition::None;
+    }
+
+    if completed.status == RunStatus::Succeeded {
+        if let Some(inc) = open_incident {
+            let duration_seconds = (event.timestamp - inc.opened_at).num_seconds().max(0);
+            return IncidentTransition::Close {
+                incident_id: inc.id,
+                closing_run_id: completed.run_id,
+                notification: IncidentNotification::Resolved {
+                    source: event.source.clone(),
+                    job_name: event.job_name.clone(),
+                    opened_at: inc.opened_at,
+                    closed_at: event.timestamp,
+                    duration_seconds,
+                },
+            };
+        }
+    }
+
+    IncidentTransition::None
+}
+
 #[derive(Debug, Clone)]
 pub struct JobWithLatestRun {
     pub job: Job,
     pub latest_run: Option<Run>,
+    pub open_incident: Option<Incident>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenIncidentSummary {
+    pub incident: Incident,
+    pub job: Job,
+    pub latest_error_excerpt: Option<String>,
+    pub external_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct JobDetails {
+    pub job: Job,
+    pub runs: Vec<Run>,
+    pub incidents: Vec<Incident>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

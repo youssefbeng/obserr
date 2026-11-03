@@ -12,6 +12,7 @@
       <tr>
         <th>Job</th>
         <th>Source</th>
+        <th>État</th>
         <th>Dernier Run</th>
         <th>Début</th>
         <th>Fin</th>
@@ -23,6 +24,7 @@
       <tr>
         <td><a href="/jobs/{{ item.source }}/{{ item.name }}">{{ item.name }}</a></td>
         <td>{{ item.source }}</td>
+        <td>{{ item.incident_state }}</td>
         <td>{{ item.latest_status }}</td>
         <td>{{ item.latest_started_at }}</td>
         <td>{{ item.latest_finished_at }}</td>

@@ -21,6 +21,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/api/v1/events", post(ingest_event))
         .route("/", get(views::dashboard))
+        .route("/incidents", get(views::incidents))
         .route("/jobs/{source}/{name}", get(views::job_detail))
         .route("/static/style.css", get(views::style_css))
         .with_state(state)
@@ -84,9 +85,19 @@ async fn ingest_event(
         kind,
     };
 
-    let mut store = state.store.lock().expect("store mutex poisoned");
-    store
-        .record_event(&event)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let notification = {
+        let mut store = state.store.lock().expect("store mutex poisoned");
+        store
+            .record_event(&event)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    };
+
+    if let Some(alert) = notification {
+        let _ = state
+            .channel
+            .send(&alert, &state.config.server.public_url)
+            .await;
+    }
+
     Ok(StatusCode::OK)
 }
