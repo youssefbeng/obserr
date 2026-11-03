@@ -1,0 +1,65 @@
+use std::collections::HashMap;
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use serde::Deserialize;
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct Config {
+    #[serde(default)]
+    pub server: ServerConfig,
+    #[serde(default)]
+    pub sources: HashMap<String, SourceConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerConfig {
+    #[serde(default = "default_listen")]
+    pub listen: String,
+    #[serde(default = "default_database_path")]
+    pub database_path: String,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            listen: default_listen(),
+            database_path: default_database_path(),
+        }
+    }
+}
+
+fn default_listen() -> String {
+    "127.0.0.1:8080".to_string()
+}
+
+fn default_database_path() -> String {
+    "obserr.db".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SourceConfig {
+    pub token: String,
+}
+
+impl Config {
+    /// Parse et valide une configuration serveur à partir d'une chaîne TOML.
+    pub fn from_toml_str(content: &str) -> Result<Self> {
+        toml::from_str(content).context("failed to parse TOML configuration")
+    }
+
+    /// Charge et parse la configuration TOML depuis un fichier sur disque.
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
+        let content = std::fs::read_to_string(path.as_ref())
+            .with_context(|| format!("failed to read config file {:?}", path.as_ref()))?;
+        Self::from_toml_str(&content)
+    }
+
+    /// Résout le nom de la `Source` associée à un jeton Bearer secret.
+    pub fn resolve_source_by_token(&self, token: &str) -> Option<String> {
+        self.sources
+            .iter()
+            .find(|(_, src)| src.token == token)
+            .map(|(name, _)| name.clone())
+    }
+}

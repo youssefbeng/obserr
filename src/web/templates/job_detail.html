@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+
+{% block title %}{{ source }} / {{ name }} — obserr{% endblock %}
+
+{% block content %}
+<h1>Job : {{ name }} <small>({{ source }})</small></h1>
+<p>Failed Runs : {{ failed_runs_count }}</p>
+
+<h2>Historique des Runs</h2>
+{% if runs.is_empty() %}
+  <p>Aucun Run enregistré.</p>
+{% else %}
+  <table>
+    <thead>
+      <tr>
+        <th>Run ID</th>
+        <th>Statut</th>
+        <th>Début</th>
+        <th>Fin</th>
+        <th>Durée</th>
+        <th>Step en échec</th>
+        <th>Lien Source</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for run in runs %}
+      <tr>
+        <td>{{ run.run_id }}</td>
+        <td>{{ run.status }}</td>
+        <td>{{ run.started_at }}</td>
+        <td>{{ run.finished_at }}</td>
+        <td>{{ run.duration }}</td>
+        <td>{{ run.failed_step }}</td>
+        <td>
+          {% if !run.external_url.is_empty() %}
+            <a href="{{ run.external_url }}" target="_blank" rel="noopener">Voir dans {{ source }}</a>
+          {% else %}
+            -
+          {% endif %}
+        </td>
+      </tr>
+      {% if !run.error_excerpt.is_empty() %}
+      <tr>
+        <td colspan="7">
+          <pre>{{ run.error_excerpt }}</pre>
+        </td>
+      </tr>
+      {% endif %}
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+{% endblock %}
