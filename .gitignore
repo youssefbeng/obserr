@@ -3,3 +3,8 @@
 docs/
 AGENTS.md
 GLOSSARY.md
+/target/
+*.db
+*.db-wal
+*.db-shm
+

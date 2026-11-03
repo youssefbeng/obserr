@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+
+{% block title %}Tableau de bord — obserr{% endblock %}
+
+{% block content %}
+<h1>Tableau de bord des Jobs</h1>
+{% if jobs.is_empty() %}
+  <p>Aucun Job enregistré pour le moment.</p>
+{% else %}
+  <table>
+    <thead>
+      <tr>
+        <th>Job</th>
+        <th>Source</th>
+        <th>Dernier Run</th>
+        <th>Début</th>
+        <th>Fin</th>
+        <th>Durée</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in jobs %}
+      <tr>
+        <td><a href="/jobs/{{ item.source }}/{{ item.name }}">{{ item.name }}</a></td>
+        <td>{{ item.source }}</td>
+        <td>{{ item.latest_status }}</td>
+        <td>{{ item.latest_started_at }}</td>
+        <td>{{ item.latest_finished_at }}</td>
+        <td>{{ item.latest_duration }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+{% endblock %}
