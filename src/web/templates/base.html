@@ -1,9 +1,11 @@
+{% if !fragment %}
 <!DOCTYPE html>
 <html lang="fr">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}obserr{% endblock %}</title>
+  <script src="/static/htmx.min.js" defer></script>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -14,8 +16,12 @@
       <a href="/incidents">Incidents</a>
     </nav>
   </header>
-  <main>
+  <main id="page-content" hx-get="{{ refresh_path }}" hx-trigger="every 30s" hx-include="#dashboard-filters" hx-swap="innerHTML" hx-sync="this:replace">
+{% endif %}
     {% block content %}{% endblock %}
+{% if !fragment %}
   </main>
 </body>
 </html>
+
+{% endif %}

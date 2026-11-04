@@ -183,11 +183,12 @@ impl Store {
         Ok(())
     }
 
-    /// Évalue à l'instant `now` tous les `Jobs` dotés d'un `Schedule`, enregistre les `Missed Runs` et ouvre les `Incidents`.
+    /// Évalue à l'instant `now` tous les `Jobs` dotés d'un `Schedule`, enregistre les `Missed Runs`, ouvre les `Incidents` et purge les historiques expirés.
     pub fn tick(
         &mut self,
         now: DateTime<Utc>,
         default_timezone: &str,
+        retention_days: u32,
     ) -> Result<Vec<IncidentNotification>> {
         self.last_tick_now = Some(now);
         let now_str = format_ts(&now);
@@ -259,8 +260,30 @@ impl Store {
             }
         }
 
+        // Évalue les Schedules avant de purger les Runs qui couvrent leurs créneaux.
+        let cutoff = now
+            .checked_sub_signed(chrono::Duration::days(i64::from(retention_days)))
+            .unwrap_or(DateTime::<Utc>::MIN_UTC);
+        Self::purge_history_in_tx(&tx, cutoff)?;
         tx.commit()?;
         Ok(notifications)
+    }
+
+    /// Purge les historiques expirés en préservant les Incidents ouverts et le dernier Run reçu par Job.
+    fn purge_history_in_tx(tx: &rusqlite::Transaction<'_>, cutoff: DateTime<Utc>) -> Result<()> {
+        // Compare les instants avec une borne stricte ; les dates nulles des Runs en cours restent exclues.
+        let cutoff = format_ts(&cutoff);
+        tx.execute("DELETE FROM incidents WHERE status = 'closed' AND julianday(closed_at) < julianday(?1)", [&cutoff])?;
+        tx.execute(
+            "DELETE FROM runs WHERE julianday(finished_at) < julianday(?1)
+                    AND id NOT IN (SELECT MAX(id) FROM runs GROUP BY job_id)",
+            [&cutoff],
+        )?;
+        tx.execute(
+            "DELETE FROM missed_runs WHERE julianday(detected_at) < julianday(?1)",
+            [&cutoff],
+        )?;
+        Ok(())
     }
 
     /// Enregistre de manière transactionnelle un événement `started` ou `finished`, met à jour l'`Incident` éventuel et crée le `Job` si nécessaire.
@@ -559,7 +582,11 @@ impl Store {
             if latest_error_excerpt.is_none() && incident.cause == IncidentCause::MissedRun {
                 if let Some(missed) = self
                     .conn
-                    .query_row(&sql_latest_missed, params![job.id], Self::map_missed_run_row)
+                    .query_row(
+                        &sql_latest_missed,
+                        params![job.id],
+                        Self::map_missed_run_row,
+                    )
                     .optional()?
                 {
                     latest_error_excerpt = Some(missed.summary_text());
@@ -578,7 +605,10 @@ impl Store {
     }
 
     /// Charge tous les `Runs` d'un `Job` dans une transaction pour vérifier la couverture des créneaux de `Schedule`.
-    fn load_all_runs_for_job_in_tx(tx: &rusqlite::Transaction<'_>, job_id: i64) -> Result<Vec<Run>> {
+    fn load_all_runs_for_job_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        job_id: i64,
+    ) -> Result<Vec<Run>> {
         let sql = format!("{SELECT_RUN_COLUMNS} WHERE job_id = ?1 ORDER BY id ASC");
         let mut stmt = tx.prepare(&sql)?;
         let runs = stmt
@@ -589,8 +619,9 @@ impl Store {
 
     /// Charge tous les `Runs` actuellement au statut `running` pour un `Job` donné dans une transaction.
     fn load_running_runs_in_tx(tx: &rusqlite::Transaction<'_>, job_id: i64) -> Result<Vec<Run>> {
-        let sql =
-            format!("{SELECT_RUN_COLUMNS} WHERE job_id = ?1 AND status = 'running' ORDER BY id ASC");
+        let sql = format!(
+            "{SELECT_RUN_COLUMNS} WHERE job_id = ?1 AND status = 'running' ORDER BY id ASC"
+        );
         let mut stmt = tx.prepare(&sql)?;
         let runs = stmt
             .query_map(params![job_id], Self::map_run_row)?

@@ -314,11 +314,87 @@ curl -fsS -X POST "http://127.0.0.1:${OBSERR_PORT}/api/v1/events" \
 webhook_count="$(wc -l <"$WEBHOOK_LOG" | tr -d ' ')"
 assert_eq "$webhook_count" "3" "alerte Slack sur Run abandonné"
 
-echo "✅ Smoke test local réussi (binaire obserr serve + SQLite sur disque + Schedules/Hot-reload + 3 webhooks Slack vérifiés)."
+echo "==> 11. Protection web activée à chaud, sans changer /health ni les jetons d'ingestion..."
+python3 - "$TMP_DIR/obserr.toml" <<'PYCONFIG'
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+path.write_text(path.read_text().replace('[server]', '[server]\nweb_password = "smoke-secret"'))
+PYCONFIG
+
+for path in / /incidents /jobs/dbt-prod/compta_nightly; do
+  code="$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${OBSERR_PORT}${path}")"
+  assert_eq "$code" "401" "page protégée $path"
+  code="$(curl -s -u 'obserr:wrong' -o /dev/null -w "%{http_code}" "http://127.0.0.1:${OBSERR_PORT}${path}")"
+  assert_eq "$code" "401" "mauvais mot de passe $path"
+  code="$(curl -s -u 'obserr:smoke-secret' -o /dev/null -w "%{http_code}" "http://127.0.0.1:${OBSERR_PORT}${path}")"
+  assert_eq "$code" "200" "mot de passe valide $path"
+  fragment="$(curl -fsS -u 'obserr:smoke-secret' -H 'HX-Request: true' "http://127.0.0.1:${OBSERR_PORT}${path}")"
+  assert_not_contains "$fragment" '<!DOCTYPE html>' "fragment htmx $path"
+done
+assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${OBSERR_PORT}/health")" "200" "health toujours public"
+assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST -u 'obserr:smoke-secret' -H 'Content-Type: application/json' -d '{"job":"test","event":"started"}' "http://127.0.0.1:${OBSERR_PORT}/api/v1/events")" "401" "Basic ne remplace pas Bearer"
+
+echo "==> 12. Filtres combinés et rafraîchissement htmx embarqué..."
+filtered="$(curl -fsS -u 'obserr:smoke-secret' "http://127.0.0.1:${OBSERR_PORT}/?status=ok&source=dbt-prod&tag=finance")"
+assert_contains "$filtered" 'href="/jobs/dbt-prod/compta_nightly"' "Job correspondant aux trois filtres"
+assert_not_contains "$filtered" 'href="/jobs/airflow-prod/adhoc_sync"' "Source exclue"
+assert_not_contains "$filtered" 'href="/jobs/dbt-prod/orders_mart"' "statut et tag exclus"
+assert_contains "$filtered" 'value="finance" selected' "filtre conservé"
+assert_contains "$filtered" 'hx-get="/" hx-trigger="every 30s"' "rafraîchissement périodique"
+assert_contains "$(curl -fsS "http://127.0.0.1:${OBSERR_PORT}/static/htmx.min.js")" 'htmx' "htmx embarqué"
+
+echo "==> 13. Purge automatique réelle : historique ancien, dernier Run et Incident ouvert..."
+# Produit des événements anciens via HTTP ; aucune écriture directe dans SQLite.
+python3 - "$TMP_DIR" <<'PYEVENTS'
+import datetime
+import json
+import pathlib
+import sys
+root = pathlib.Path(sys.argv[1])
+old = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=3)).isoformat()
+for filename, job, run_id, status in [
+    ('retention-fail', 'retention_closed', 'expired-failure', 'failed'),
+    ('retention-recover', 'retention_closed', 'expired-recovery', 'succeeded'),
+    ('retention-last', 'retention_closed', 'preserved-last', 'succeeded'),
+    ('retention-open', 'retention_open', 'preserved-failure', 'failed'),
+]:
+    (root / (filename + '.json')).write_text(json.dumps(dict(job=job, event='finished', run_id=run_id, status=status, timestamp=old)))
+PYEVENTS
+for payload in retention-fail retention-recover retention-last retention-open; do
+  curl -fsS -X POST "http://127.0.0.1:${OBSERR_PORT}/api/v1/events" \
+    -H 'Authorization: Bearer secret-dbt-token' -H 'Content-Type: application/json' \
+    --data-binary "@$TMP_DIR/$payload.json" >/dev/null
+done
+before_purge="$(curl -fsS -u 'obserr:smoke-secret' "http://127.0.0.1:${OBSERR_PORT}/jobs/dbt-prod/retention_closed")"
+assert_contains "$before_purge" 'expired-failure' "historique conservé avec rétention par défaut"
+assert_contains "$before_purge" '<td>closed</td>' "Incident fermé avant purge"
+python3 - "$TMP_DIR/obserr.toml" <<'PYCONFIG'
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+path.write_text(path.read_text().replace('[server]', '[server]\nretention_days = 1'))
+PYCONFIG
+# Attend le vrai tick périodique (30 secondes) et vérifie le résultat à travers l'UI.
+for attempt in $(seq 1 200); do
+  after_purge="$(curl -fsS -u 'obserr:smoke-secret' "http://127.0.0.1:${OBSERR_PORT}/jobs/dbt-prod/retention_closed")"
+  if [[ "$after_purge" != *'expired-failure'* ]]; then break; fi
+  sleep 0.25
+done
+assert_not_contains "$after_purge" 'expired-failure' "ancien Run en échec purgé"
+assert_not_contains "$after_purge" 'expired-recovery' "ancien Run réussi purgé"
+assert_not_contains "$after_purge" '<td>closed</td>' "ancien Incident fermé purgé"
+assert_contains "$after_purge" 'preserved-last' "dernier Run ancien conservé"
+open_after_purge="$(curl -fsS -u 'obserr:smoke-secret' "http://127.0.0.1:${OBSERR_PORT}/jobs/dbt-prod/retention_open")"
+assert_contains "$open_after_purge" '<td>open</td>' "Incident ouvert ancien conservé"
+assert_contains "$open_after_purge" 'preserved-failure' "dernier Run en échec conservé"
+
+echo "✅ Smoke test local réussi (binaire obserr serve + SQLite sur disque + Schedules/Hot-reload + Slack + authentification/htmx/rétention vérifiés)."
 
 if [[ "$KEEP_RUNNING" == "true" ]]; then
   echo ""
   echo "🌐 Mode interactif actif :"
+  echo "   - Identifiants web : obserr / smoke-secret"
   echo "   - Tableau de bord  : http://127.0.0.1:${OBSERR_PORT}/"
   echo "   - Incidents ouverts: http://127.0.0.1:${OBSERR_PORT}/incidents"
   echo "   - Détail Job résolu: http://127.0.0.1:${OBSERR_PORT}/jobs/dbt-prod/compta_nightly"
