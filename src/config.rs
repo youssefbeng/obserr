@@ -16,6 +16,10 @@ pub struct Config {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
+    #[serde(default)]
+    pub web_password: Option<String>,
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u32,
     #[serde(default = "default_listen")]
     pub listen: String,
     #[serde(default = "default_database_path")]
@@ -29,6 +33,8 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            web_password: None,
+            retention_days: default_retention_days(),
             listen: default_listen(),
             database_path: default_database_path(),
             public_url: default_public_url(),
@@ -41,6 +47,10 @@ impl Default for ServerConfig {
 pub struct ChannelConfig {
     #[serde(default)]
     pub webhook_url: Option<String>,
+}
+
+fn default_retention_days() -> u32 {
+    90
 }
 
 fn default_listen() -> String {
@@ -201,9 +211,8 @@ impl Config {
         let raw: RawConfig =
             toml::from_str(content).context("failed to parse TOML configuration")?;
 
-        parse_timezone(&raw.server.timezone).with_context(|| {
-            format!("invalid global server timezone '{}'", raw.server.timezone)
-        })?;
+        parse_timezone(&raw.server.timezone)
+            .with_context(|| format!("invalid global server timezone '{}'", raw.server.timezone))?;
 
         let mut jobs = Vec::new();
         let mut source_keys: Vec<_> = raw.jobs.into_iter().collect();

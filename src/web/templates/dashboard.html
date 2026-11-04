@@ -4,8 +4,29 @@
 
 {% block content %}
 <h1>Tableau de bord des Jobs</h1>
+<form id="dashboard-filters" method="get" action="/" hx-get="/" hx-trigger="change, submit" hx-target="#page-content" hx-sync="#page-content:replace">
+  <label for="status">État</label>
+  <select id="status" name="status">
+    <option value="">Tous les états</option>
+    <option value="incident"{% if filters.status == "incident" %} selected{% endif %}>Incident ouvert</option>
+    <option value="ok"{% if filters.status == "ok" %} selected{% endif %}>OK</option>
+    <option value="unscheduled"{% if filters.status == "unscheduled" %} selected{% endif %}>Sans Schedule</option>
+  </select>
+  <label for="source">Source</label>
+  <select id="source" name="source">
+    <option value="">Toutes les Sources</option>
+    {% for source in sources %}<option value="{{ source }}"{% if filters.source == source.as_str() %} selected{% endif %}>{{ source }}</option>{% endfor %}
+  </select>
+  <label for="tag">Tag</label>
+  <select id="tag" name="tag">
+    <option value="">Tous les tags</option>
+    {% for tag in tags %}<option value="{{ tag }}"{% if filters.tag == tag.as_str() %} selected{% endif %}>{{ tag }}</option>{% endfor %}
+  </select>
+  <button type="submit">Filtrer</button>
+  <a href="/">Réinitialiser</a>
+</form>
 {% if jobs.is_empty() %}
-  <p>Aucun Job enregistré pour le moment.</p>
+  <p>Aucun Job ne correspond aux filtres.</p>
 {% else %}
   <table>
     <thead>

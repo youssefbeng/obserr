@@ -99,13 +99,13 @@ impl AppState {
         }
     }
 
-    /// Évalue à l'instant `now` tous les `Schedules` des `Jobs`, enregistre les `Missed Runs` et envoie les alertes d'`Incidents`.
+    /// Évalue à l'instant `now` tous les `Schedules` des `Jobs`, enregistre les `Missed Runs`, purge les historiques expirés et envoie les alertes d'`Incidents`.
     pub async fn tick(&self, now: DateTime<Utc>) -> Result<Vec<IncidentNotification>> {
         self.reload_if_changed(Some(now));
         let cfg = self.current_config();
         let notifications = {
             let mut store = self.store.lock().expect("store mutex poisoned");
-            store.tick(now, &cfg.server.timezone)?
+            store.tick(now, &cfg.server.timezone, cfg.server.retention_days)?
         };
 
         for alert in &notifications {

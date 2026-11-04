@@ -1,10 +1,13 @@
+use std::collections::BTreeSet;
+
 use askama::Template;
 use axum::{
-    extract::{Path, State},
-    http::{StatusCode, header},
+    extract::{OriginalUri, Path, Query, State},
+    http::{HeaderMap, StatusCode, header},
     response::{Html, IntoResponse, Response},
 };
 use chrono::{DateTime, SecondsFormat, Utc};
+use serde::Deserialize;
 
 use crate::{
     AppState,
@@ -16,7 +19,25 @@ const STYLE_CSS: &str = include_str!("static/style.css");
 
 /// Sert la feuille de style CSS embarquée dans le binaire.
 pub async fn style_css() -> impl IntoResponse {
-    ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], STYLE_CSS)
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        STYLE_CSS,
+    )
+}
+
+/// Sert htmx embarqué pour permettre le rafraîchissement sans accès à un CDN.
+pub async fn htmx_js() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("static/htmx.min.js"),
+    )
+}
+
+/// Identifie les demandes de fragments émises par htmx.
+fn is_fragment(headers: &HeaderMap) -> bool {
+    headers
+        .get("hx-request")
+        .is_some_and(|value| value == "true")
 }
 
 fn format_ts(ts: DateTime<Utc>) -> String {
@@ -133,6 +154,11 @@ impl From<JobWithLatestRun> for DashboardJobRow {
 #[derive(Template)]
 #[template(path = "dashboard.html")]
 struct DashboardTemplate {
+    refresh_path: &'static str,
+    fragment: bool,
+    filters: DashboardFilters,
+    sources: BTreeSet<String>,
+    tags: BTreeSet<String>,
     jobs: Vec<DashboardJobRow>,
 }
 
@@ -205,6 +231,8 @@ impl From<Run> for JobRunRow {
 #[derive(Template)]
 #[template(path = "job_detail.html")]
 struct JobDetailTemplate {
+    refresh_path: String,
+    fragment: bool,
     source: String,
     name: String,
     status_label: String,
@@ -246,12 +274,42 @@ impl From<OpenIncidentSummary> for OpenIncidentRow {
 #[derive(Template)]
 #[template(path = "incidents.html")]
 struct IncidentsTemplate {
+    refresh_path: &'static str,
+    fragment: bool,
     incidents: Vec<OpenIncidentRow>,
 }
 
+/// Filtres combinables de la vue ; les valeurs vides signifient « tous ».
+#[derive(Default, Deserialize)]
+pub struct DashboardFilters {
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    tag: String,
+}
+
+impl DashboardFilters {
+    /// Filtre les Jobs sur leur état métier et leurs métadonnées exactes.
+    fn matches(&self, item: &JobWithLatestRun) -> bool {
+        let status_matches = self.status.is_empty()
+            || matches!(
+                (self.status.as_str(), item.status_label()),
+                ("incident", "Incident ouvert") | ("ok", "OK") | ("unscheduled", "Sans Schedule")
+            );
+        status_matches
+            && (self.source.is_empty() || item.job.source == self.source)
+            && (self.tag.is_empty() || item.job.tags.contains(&self.tag))
+    }
+}
+
 /// Rend la page HTML du Tableau de bord (`/`) listant tous les `Jobs` avec les `Incidents` ouverts en tête.
-pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>, StatusCode> {
-    state.reload_if_changed(None);
+pub async fn dashboard(
+    State(state): State<AppState>,
+    Query(filters): Query<DashboardFilters>,
+    headers: HeaderMap,
+) -> Result<Html<String>, StatusCode> {
     let cfg = state.current_config();
     let items = {
         let store = state.store.lock().expect("store mutex poisoned");
@@ -260,16 +318,41 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>, St
             .list_jobs_with_latest_run(&cfg.server.timezone, ref_now)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     };
-    let jobs = items.into_iter().map(DashboardJobRow::from).collect();
-    let tpl = DashboardTemplate { jobs };
+    let mut sources: BTreeSet<String> = items.iter().map(|item| item.job.source.clone()).collect();
+    let mut tags: BTreeSet<String> = items
+        .iter()
+        .flat_map(|item| item.job.tags.iter().cloned())
+        .collect();
+    // Conserve aussi une valeur inconnue pour que le prochain rafraîchissement garde le filtre.
+    if !filters.source.is_empty() {
+        sources.insert(filters.source.clone());
+    }
+    if !filters.tag.is_empty() {
+        tags.insert(filters.tag.clone());
+    }
+    let jobs = items
+        .into_iter()
+        .filter(|item| filters.matches(item))
+        .map(DashboardJobRow::from)
+        .collect();
+    let tpl = DashboardTemplate {
+        refresh_path: "/",
+        jobs,
+        filters,
+        sources,
+        tags,
+        fragment: is_fragment(&headers),
+    };
     tpl.render()
         .map(Html)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// Rend la Page des `Incidents` ouverts (`/incidents`) avec l'heure d'ouverture, la cause initiale, le dernier extrait d'erreur et le lien vers la `Source`.
-pub async fn incidents(State(state): State<AppState>) -> Result<Html<String>, StatusCode> {
-    state.reload_if_changed(None);
+pub async fn incidents(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, StatusCode> {
     let summaries = {
         let store = state.store.lock().expect("store mutex poisoned");
         store
@@ -277,7 +360,11 @@ pub async fn incidents(State(state): State<AppState>) -> Result<Html<String>, St
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     };
     let rows = summaries.into_iter().map(OpenIncidentRow::from).collect();
-    let tpl = IncidentsTemplate { incidents: rows };
+    let tpl = IncidentsTemplate {
+        refresh_path: "/incidents",
+        incidents: rows,
+        fragment: is_fragment(&headers),
+    };
     tpl.render()
         .map(Html)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
@@ -287,8 +374,9 @@ pub async fn incidents(State(state): State<AppState>) -> Result<Html<String>, St
 pub async fn job_detail(
     State(state): State<AppState>,
     Path((source, name)): Path<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
-    state.reload_if_changed(None);
     let cfg = state.current_config();
     let details_opt = {
         let store = state.store.lock().expect("store mutex poisoned");
@@ -312,6 +400,8 @@ pub async fn job_detail(
     let missed_runs_count = details.missed_runs.len();
 
     let tpl = JobDetailTemplate {
+        refresh_path: uri.path().to_owned(),
+        fragment: is_fragment(&headers),
         source: details.job.source,
         name: details.job.name,
         status_label: meta.status_label,
@@ -333,6 +423,8 @@ pub async fn job_detail(
             .collect(),
         runs: details.runs.into_iter().map(JobRunRow::from).collect(),
     };
-    let html = tpl.render().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let html = tpl
+        .render()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Html(html).into_response())
 }

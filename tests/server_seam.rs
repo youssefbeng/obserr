@@ -1502,7 +1502,7 @@ grace = "15m"
         .unwrap(),
     )
     .await;
-    assert!(!dash_after.contains("Incident ouvert"));
+    assert!(!dash_after.contains("<td>Incident ouvert</td>"));
     assert!(dash_after.contains("OK"));
 }
 
@@ -1664,3 +1664,487 @@ tags = ["v2", "hot-reloaded"]
 
 
 
+
+/// Exercises optional web authentication and credential rotation without changing ingestion auth.
+#[tokio::test]
+async fn web_password_protects_all_pages_and_reloads_without_affecting_api_or_health() {
+    let config_text = r#"
+[server]
+web_password = "web:secret"
+[sources.dbt-prod]
+token = "secret-dbt-token"
+[jobs.dbt-prod.daily]
+"#;
+    let state = AppState::new(
+        Config::from_toml_str(config_text).unwrap(),
+        Store::open_in_memory().unwrap(),
+    );
+    let app = web::router(state.clone());
+    for path in ["/", "/incidents", "/jobs/dbt-prod/daily"] {
+        for auth in [
+            None,
+            Some("Basic invalid!"),
+            Some("Basic dXNlcjp3cm9uZw=="),
+            Some("Bearer secret-dbt-token"),
+        ] {
+            let mut req = Request::builder().uri(path);
+            if let Some(auth) = auth {
+                req = req.header("authorization", auth);
+            }
+            let res = app
+                .clone()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{path}");
+            assert!(
+                res.headers()["www-authenticate"]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("Basic ")
+            );
+        }
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header("authorization", "Basic dXNlcjp3ZWI6c2VjcmV0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{path}");
+    }
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    for (auth, status) in [
+        ("Bearer secret-dbt-token", StatusCode::OK),
+        ("Basic dXNlcjp3ZWI6c2VjcmV0", StatusCode::UNAUTHORIZED),
+    ] {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/events")
+                    .header("authorization", auth)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"job":"daily","event":"finished","status":"succeeded"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), status);
+    }
+    state
+        .reload_config(
+            Config::from_toml_str(&config_text.replace("web:secret", "rotated")).unwrap(),
+            None,
+        )
+        .unwrap();
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header("authorization", "Basic dXNlcjp3ZWI6c2VjcmV0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    state
+        .reload_config(
+            Config::from_toml_str(&config_text.replace("web_password = \"web:secret\"", ""))
+                .unwrap(),
+            None,
+        )
+        .unwrap();
+    for path in ["/", "/incidents", "/jobs/dbt-prod/daily"] {
+        let res = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+}
+
+/// Checks intersecting dashboard filters and the same results when htmx refreshes the view.
+#[tokio::test]
+async fn dashboard_filters_status_source_and_exact_tag_and_refreshes_all_views() {
+    let config = Config::from_toml_str(
+        r#"
+[sources.dbt-prod]
+token = "secret-dbt-token"
+[jobs.dbt-prod.scheduled]
+schedule = "0 2 * * *"
+tags = ["finance"]
+[jobs.dbt-prod.broken]
+tags = ["finance", "urgent"]
+[jobs.airflow-prod.adhoc]
+tags = ["finance-archive"]
+"#,
+    )
+    .unwrap();
+    let app = web::router(AppState::new(config, Store::open_in_memory().unwrap()));
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/events")
+                .header("authorization", "Bearer secret-dbt-token")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"job":"broken","event":"finished","status":"failed"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    for (query, names) in [
+        ("", vec!["scheduled", "broken", "adhoc"]),
+        ("?status=incident", vec!["broken"]),
+        ("?status=ok", vec!["scheduled"]),
+        ("?status=unscheduled", vec!["adhoc"]),
+        ("?source=airflow-prod", vec!["adhoc"]),
+        ("?tag=finance", vec!["scheduled", "broken"]),
+        (
+            "?status=incident&source=dbt-prod&tag=urgent",
+            vec!["broken"],
+        ),
+        ("?status=ok&source=airflow-prod", vec![]),
+        ("?tag=unknown", vec![]),
+    ] {
+        for fragment in [false, true] {
+            let req = Request::builder()
+                .uri(format!("/{query}"))
+                .header("hx-request", fragment.to_string())
+                .body(Body::empty())
+                .unwrap();
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let html = body_string(res).await;
+            for (source, name) in [
+                ("dbt-prod", "scheduled"),
+                ("dbt-prod", "broken"),
+                ("airflow-prod", "adhoc"),
+            ] {
+                assert_eq!(
+                    html.contains(&format!("href=\"/jobs/{source}/{name}\"")),
+                    names.contains(&name),
+                    "{query}: {name}"
+                );
+            }
+            assert_eq!(html.contains("<!DOCTYPE html>"), !fragment);
+            assert!(html.contains("name=\"status\""));
+            assert!(html.contains("name=\"source\""));
+            assert!(html.contains("name=\"tag\""));
+        }
+    }
+    for path in ["/", "/incidents", "/jobs/dbt-prod/broken"] {
+        let html = body_string(
+            app.clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(html.contains("src=\"/static/htmx.min.js\""));
+        assert!(html.contains("hx-trigger=\"every 30s\""));
+        assert!(
+            html.contains(&format!("hx-get=\"{path}\"")),
+            "polling must use the page path"
+        );
+        assert!(!html.contains("hx-get=\"\""));
+        let fragment = body_string(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header("hx-request", "true")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(!fragment.contains("<!DOCTYPE html>"));
+    }
+    let html = body_string(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/?status=incident&source=dbt-prod&tag=urgent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        html.contains("hx-get=\"/\" hx-trigger=\"every 30s\""),
+        "polling a filtered URL must not append filters to an existing query"
+    );
+    assert!(html.contains("value=\"incident\" selected"));
+    assert!(html.contains("value=\"dbt-prod\" selected"));
+    assert!(html.contains("value=\"urgent\" selected"));
+    let js = app
+        .oneshot(
+            Request::builder()
+                .uri("/static/htmx.min.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(js.status(), StatusCode::OK);
+    assert!(
+        js.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .contains("javascript")
+    );
+    assert!(body_string(js).await.contains("htmx"));
+}
+
+/// Sends a real ingestion request through the server's public interface.
+async fn ingest_json(app: &axum::Router, payload: serde_json::Value) {
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/events")
+                .header("authorization", "Bearer secret-dbt-token")
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+/// Reads the observable HTML rather than inspecting database rows.
+async fn page_html(app: &axum::Router, path: &str) -> String {
+    let res = app
+        .clone()
+        .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    body_string(res).await
+}
+
+/// Purges expired history at the default cutoff while keeping the boundary, latest Runs and open Incidents.
+#[tokio::test]
+async fn tick_purges_expired_history_and_preserves_latest_runs_open_incidents_and_boundary() {
+    let config_text = "[sources.dbt-prod]\ntoken = \"secret-dbt-token\"";
+    let state = AppState::new(
+        Config::from_toml_str(config_text).unwrap(),
+        Store::open_in_memory().unwrap(),
+    );
+    let app = web::router(state.clone());
+    for (job, run_id, status, timestamp) in [
+        (
+            "history",
+            "expired-failure",
+            "failed",
+            "2025-12-30T00:00:00Z",
+        ),
+        (
+            "history",
+            "expired-recovery",
+            "succeeded",
+            "2025-12-31T00:00:00Z",
+        ),
+        (
+            "history",
+            "boundary-failure",
+            "failed",
+            "2025-12-31T23:59:59Z",
+        ),
+        (
+            "history",
+            "boundary-recovery",
+            "succeeded",
+            "2026-01-01T00:00:00Z",
+        ),
+        (
+            "history",
+            "recent-failure",
+            "failed",
+            "2026-03-31T00:00:00Z",
+        ),
+        (
+            "history",
+            "recent-recovery",
+            "succeeded",
+            "2026-04-01T00:00:00Z",
+        ),
+        (
+            "old-latest",
+            "old-first",
+            "succeeded",
+            "2025-12-29T00:00:00Z",
+        ),
+        (
+            "old-latest",
+            "old-last",
+            "succeeded",
+            "2025-12-30T00:00:00Z",
+        ),
+        ("open", "old-open-failure", "failed", "2025-12-30T00:00:00Z"),
+    ] {
+        ingest_json(&app, serde_json::json!({"job":job,"event":"finished","run_id":run_id,"status":status,"timestamp":timestamp})).await;
+    }
+    ingest_json(&app, serde_json::json!({"job":"open","event":"started","run_id":"still-running","timestamp":"2025-12-31T00:00:00Z"})).await;
+    // A later finished-only event must not make an ongoing Run eligible for deletion.
+    ingest_json(&app, serde_json::json!({"job":"open","event":"finished","status":"failed","run_id":"newer-failure","timestamp":"2026-01-01T00:00:00Z"})).await;
+    assert!(
+        page_html(&app, "/jobs/dbt-prod/history")
+            .await
+            .contains("expired-failure")
+    );
+    assert!(
+        state
+            .tick("2026-04-01T00:00:00Z".parse().unwrap())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let html = page_html(&app, "/jobs/dbt-prod/history").await;
+    for gone in [
+        "expired-failure",
+        "expired-recovery",
+        "boundary-failure",
+        "2025-12-30T00:00:00Z",
+    ] {
+        assert!(!html.contains(gone), "{gone}");
+    }
+    for kept in ["boundary-recovery", "recent-failure", "recent-recovery"] {
+        assert!(html.contains(kept), "{kept}");
+    }
+    assert_eq!(html.matches("<td>closed</td>").count(), 2);
+    let old = page_html(&app, "/jobs/dbt-prod/old-latest").await;
+    assert!(old.contains("old-last"));
+    assert!(!old.contains("old-first"));
+    let open = page_html(&app, "/jobs/dbt-prod/open").await;
+    assert!(open.contains("still-running"));
+    assert!(open.contains("<td>open</td>"));
+    assert!(
+        page_html(&app, "/incidents")
+            .await
+            .contains("2025-12-30T00:00:00Z")
+    );
+    // The next tick observes a shorter retention without restarting the application.
+    state
+        .reload_config(
+            Config::from_toml_str(&format!("[server]\nretention_days = 1\n{config_text}")).unwrap(),
+            None,
+        )
+        .unwrap();
+    state
+        .tick("2026-04-01T00:00:00Z".parse().unwrap())
+        .await
+        .unwrap();
+    let html = page_html(&app, "/jobs/dbt-prod/history").await;
+    assert!(!html.contains("boundary-recovery"));
+    assert!(html.contains("recent-failure"));
+    assert_eq!(html.matches("<td>closed</td>").count(), 1);
+}
+
+/// Purging Missed Runs never replays evaluated slots or closes a still-open Incident.
+#[tokio::test]
+async fn retention_purges_missed_runs_without_reopening_incidents_or_replaying_slots() {
+    let config = Config::from_toml_str(
+        r#"
+[server]
+retention_days = 1
+[sources.dbt-prod]
+token = "secret-dbt-token"
+[jobs.dbt-prod.daily]
+schedule = "0 0 * * *"
+"#,
+    )
+    .unwrap();
+    let state = AppState::new(config, Store::open_in_memory().unwrap());
+    let app = web::router(state.clone());
+    state
+        .tick("2026-01-01T00:00:01Z".parse().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        state
+            .tick("2026-01-02T00:00:00Z".parse().unwrap())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    ingest_json(&app, serde_json::json!({"job":"daily","event":"finished","run_id":"recovery","status":"succeeded","timestamp":"2026-01-02T00:01:00Z"})).await;
+    assert_eq!(
+        state
+            .tick("2026-01-03T00:00:00Z".parse().unwrap())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        state
+            .tick("2026-01-04T00:00:00Z".parse().unwrap())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let html = page_html(&app, "/jobs/dbt-prod/daily").await;
+    assert!(html.contains("Missed Runs : 2"));
+    assert!(!html.contains("<td>2026-01-02T00:00:00Z</td>"));
+    assert!(html.contains("<td>2026-01-03T00:00:00Z</td>"));
+    assert!(!html.contains("<td>closed</td>"));
+    for _ in 0..2 {
+        assert!(
+            state
+                .tick("2026-01-05T00:00:01Z".parse().unwrap())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let html = page_html(&app, "/jobs/dbt-prod/daily").await;
+        assert!(html.contains("Missed Runs : 1"));
+        assert!(html.contains("<td>open</td>"));
+        assert!(html.contains("recovery"), "last Run is kept even when old");
+        assert!(
+            page_html(&app, "/incidents")
+                .await
+                .contains("2026-01-03T00:00:00Z")
+        );
+    }
+    ingest_json(&app, serde_json::json!({"job":"daily","event":"finished","run_id":"latest-recovery","status":"succeeded","timestamp":"2026-01-05T00:01:00Z"})).await;
+    assert!(!page_html(&app, "/incidents").await.contains("daily"));
+    assert!(
+        page_html(&app, "/jobs/dbt-prod/daily")
+            .await
+            .contains("<td>closed</td>")
+    );
+}

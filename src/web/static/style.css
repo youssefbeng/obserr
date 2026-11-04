@@ -56,3 +56,6 @@ pre {
 a {
   color: var(--accent);
 }
+
+#dashboard-filters { display: flex; flex-wrap: wrap; align-items: center; gap: .75rem; margin-bottom: 1.5rem; }
+select, button { font: inherit; padding: .4rem .6rem; }

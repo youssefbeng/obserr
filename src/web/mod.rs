@@ -17,13 +17,20 @@ use crate::{
 
 /// Construit le routeur HTTP `axum` exposant `/health`, l'API d'ingestion et les pages du Dashboard.
 pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/health", get(health))
-        .route("/api/v1/events", post(ingest_event))
+    let pages = Router::new()
         .route("/", get(views::dashboard))
         .route("/incidents", get(views::incidents))
         .route("/jobs/{source}/{name}", get(views::job_detail))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_web_password,
+        ));
+    Router::new()
+        .merge(pages)
+        .route("/health", get(health))
+        .route("/api/v1/events", post(ingest_event))
         .route("/static/style.css", get(views::style_css))
+        .route("/static/htmx.min.js", get(views::htmx_js))
         .with_state(state)
 }
 
