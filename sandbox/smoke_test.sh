@@ -438,6 +438,33 @@ assert_eq "$down_ok" "0" "serveur injoignable : code 0 conservé"
 assert_eq "$down_ko" "2" "serveur injoignable : code 2 conservé"
 assert_contains "$(cat "$TMP_DIR/run_down.err")" "warning" "avertissement court sur stderr"
 
+# Plugin Airflow : rejoue les hooks listener (started, échec de tâche, finished) face au vrai binaire.
+export PYTHONPATH="$ROOT_DIR/integrations/airflow"
+OBSERR_URL="http://127.0.0.1:${OBSERR_PORT}" OBSERR_TOKEN=rotated-airflow-token \
+  OBSERR_AIRFLOW_BASE_URL="http://airflow.local:8080" python3 - <<'PY'
+from types import SimpleNamespace
+import obserr_airflow_listener as L
+
+ok = SimpleNamespace(dag_id="af_ok", run_id="run_ok", get_task_instances=lambda: [])
+L.on_dag_run_running(ok, "")
+L.on_dag_run_success(ok, "")
+bad = SimpleNamespace(dag_id="af_bad", run_id="run_bad", get_task_instances=lambda: [])
+L.on_dag_run_running(bad, "")
+ti = SimpleNamespace(dag_id="af_bad", run_id="run_bad", task_id="load_orders")
+L.on_task_instance_failed(None, ti, *([RuntimeError("kaboom")] if L._airflow_major() >= 3 else []))
+L.on_dag_run_failed(bad, "")
+PY
+af_ok="$(curl -fsS -u 'obserr:smoke-secret' "http://127.0.0.1:${OBSERR_PORT}/jobs/airflow-prod/af_ok")"
+assert_contains "$af_ok" "succeeded" "Run Airflow succeeded via plugin"
+assert_contains "$af_ok" "http://airflow.local:8080/dags/af_ok/" "external_url Airflow du DAG run"
+af_bad="$(curl -fsS -u 'obserr:smoke-secret' "http://127.0.0.1:${OBSERR_PORT}/jobs/airflow-prod/af_bad")"
+assert_contains "$af_bad" "failed" "Run Airflow failed via plugin"
+assert_contains "$af_bad" "load_orders" "Step en échec capturé par le plugin"
+OBSERR_URL="http://127.0.0.1:1" python3 -c "
+import obserr_airflow_listener as L
+from types import SimpleNamespace
+L.on_dag_run_running(SimpleNamespace(dag_id='x', run_id='y'), '')"
+
 echo "✅ Smoke test local réussi (binaire obserr serve + obserr run + SQLite sur disque + Schedules/Hot-reload + Slack + authentification/htmx/rétention vérifiés)."
 
 if [[ "$KEEP_RUNNING" == "true" ]]; then
