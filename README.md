@@ -46,6 +46,19 @@ cargo test
 
 Le smoke test affiche le mot de passe de démonstration lorsqu'il reste actif.
 
+## Bac à sable de bout en bout (dbt Core + Airflow)
+
+Le dossier `sandbox/` fournit un environnement 100 % local (sans cloud) combinant :
+- un projet **dbt Core** (`sandbox/dbt/`, Python 3.12 via `uv`, `dbt-duckdb` local) avec un modèle qui réussit (`ok_model`) et un modèle qui échoue à la demande (`flaky_model` avec `SANDBOX_DBT_FAIL=1`), exécuté via `obserr run --job dbt_sandbox -- uv run dbt run` ;
+- une instance **Airflow** locale (`sandbox/docker-compose.yml`) avec le plugin listener monté dans `plugins/` et deux DAGs (`sandbox_ok` et `sandbox_fail`) poussant leurs événements vers `obserr serve` sur l'hôte ;
+- un fichier de configuration de démonstration (`sandbox/obserr.demo.toml`) et un récepteur de webhooks Slack local (`sandbox/slack_receiver.py`).
+
+```sh
+./sandbox/e2e.sh
+# Laisser le Dashboard (http://127.0.0.1:18090, obserr / sandbox) et Airflow (http://localhost:8080) actifs :
+./sandbox/e2e.sh --keep-running
+```
+
 ## Dépendance web embarquée
 
 htmx 2.0.11 est embarqué dans `src/web/static/htmx.min.js`, avec sa licence

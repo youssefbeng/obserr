@@ -161,3 +161,18 @@ def test_missing_task_log_is_ignored(server, tmp_path, monkeypatch):
     monkeypatch.setattr(L, "_log_folder", lambda: str(tmp_path))
     L.on_dag_run_failed(dag_run([("transform", "failed")]), "")
     assert "error_excerpt" not in server.requests[0][2]
+
+
+def test_fallback_uses_loaded_task_instances_when_new_session_commit_is_prohibited(server):
+    def forbidden_new_session():
+        raise RuntimeError("UNEXPECTED COMMIT - THIS WILL BREAK HA LOCKS!")
+
+    dr = SimpleNamespace(
+        dag_id="etl",
+        run_id="manual__2026",
+        task_instances=[SimpleNamespace(task_id="boom", state="failed")],
+        get_task_instances=forbidden_new_session,
+    )
+    L.on_dag_run_failed(dr, "")
+    assert server.requests[0][2]["failed_step"] == "boom"
+

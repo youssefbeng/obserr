@@ -11,3 +11,10 @@ GLOSSARY.md
 integrations/airflow/.venv/
 __pycache__/
 .pytest_cache/
+sandbox/dbt/.venv/
+sandbox/dbt/target/
+sandbox/dbt/logs/
+sandbox/dbt/*.duckdb*
+sandbox/dbt/.user.yml
+sandbox/dbt/uv.lock
+sandbox/.run/

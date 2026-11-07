@@ -1,0 +1,21 @@
+[server]
+listen = "0.0.0.0:18090"
+database_path = "sandbox-demo.db"
+public_url = "http://127.0.0.1:18090"
+timezone = "UTC"
+web_password = "sandbox"
+
+[channel]
+webhook_url = "http://127.0.0.1:18091/slack"
+
+[sources.dbt-sandbox]
+token = "sandbox-dbt-token"
+
+[sources.airflow-prod]
+token = "sandbox-airflow-token"
+
+[jobs.dbt-sandbox.dbt_sandbox]
+owner = "sandbox"
+
+[jobs.airflow-prod.sandbox_ok]
+[jobs.airflow-prod.sandbox_fail]

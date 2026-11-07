@@ -64,27 +64,7 @@ assert_eq() {
 # Démarre un récepteur HTTP local de webhooks Slack enregistrant chaque requête JSON dans WEBHOOK_LOG.
 start_webhook_receiver() {
   touch "$WEBHOOK_LOG"
-  python3 - "$WEBHOOK_PORT" "$WEBHOOK_LOG" <<'PY' &
-import http.server
-import sys
-
-port = int(sys.argv[1])
-log_path = sys.argv[2]
-
-class Handler(http.server.BaseHTTPRequestHandler):
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(length).decode("utf-8", errors="replace")
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(body.replace("\n", "\\n") + "\n")
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"ok")
-    def log_message(self, format, *args):
-        pass
-
-http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
-PY
+  python3 "$ROOT_DIR/sandbox/slack_receiver.py" "$WEBHOOK_PORT" "$WEBHOOK_LOG" >/dev/null &
   WEBHOOK_PID=$!
 }
 
@@ -479,6 +459,10 @@ OBSERR_URL="http://127.0.0.1:1" OBSERR_TOKEN=x python3 -c "
 import obserr_airflow_listener as L
 from types import SimpleNamespace
 L.on_dag_run_running(SimpleNamespace(dag_id='x', run_id='y'), '')"
+
+# Bac à sable : la configuration de démonstration doit rester chargeable par le vrai binaire.
+(cd "$TMP_DIR" && timeout 2 "$ROOT_DIR/target/debug/obserr" serve --config "$ROOT_DIR/sandbox/obserr.demo.toml" >/dev/null 2>&1; [[ $? -eq 124 ]]) \
+  || { echo "❌ ÉCHEC : sandbox/obserr.demo.toml invalide" >&2; exit 1; }
 
 echo "✅ Smoke test local réussi (binaire obserr serve + obserr run + SQLite sur disque + Schedules/Hot-reload + Slack + authentification/htmx/rétention vérifiés)."
 

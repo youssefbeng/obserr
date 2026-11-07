@@ -1,0 +1,17 @@
+# Airflow local (standalone, SQLite) avec le listener obserr monté dans plugins/.
+# obserr serve tourne sur l'hôte (port 18090) ; le conteneur le joint via host.docker.internal.
+services:
+  airflow:
+    image: apache/airflow:2.9.3
+    command: standalone
+    ports: ["8080:8080"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    environment:
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      OBSERR_URL: http://host.docker.internal:18090
+      OBSERR_TOKEN: sandbox-airflow-token
+      OBSERR_AIRFLOW_BASE_URL: http://localhost:8080
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags:ro
+      - ../integrations/airflow/obserr_airflow_listener.py:/opt/airflow/plugins/obserr_airflow_listener.py:ro
