@@ -389,7 +389,56 @@ open_after_purge="$(curl -fsS -u 'obserr:smoke-secret' "http://127.0.0.1:${OBSER
 assert_contains "$open_after_purge" '<td>open</td>' "Incident ouvert ancien conservé"
 assert_contains "$open_after_purge" 'preserved-failure' "dernier Run en échec conservé"
 
-echo "✅ Smoke test local réussi (binaire obserr serve + SQLite sur disque + Schedules/Hot-reload + Slack + authentification/htmx/rétention vérifiés)."
+echo "==> 14. CLI enveloppe obserr run autour d'une fausse commande dbt Core (succès, échec, serveur injoignable)..."
+# Simule `dbt build` : succès par défaut, ou échec (code 2) avec 25 lignes sur stderr si FAKE_DBT_FAIL=1.
+cat >"$TMP_DIR/dbt" <<'FAKEDBT'
+#!/usr/bin/env bash
+echo "Running with dbt=1.8.0 ($*)"
+if [[ "${FAKE_DBT_FAIL:-0}" == "1" ]]; then
+  for i in $(seq -w 1 25); do echo "dbt-err-$i: Database Error in model stg_orders" >&2; done
+  exit 2
+fi
+echo "Completed successfully"
+FAKEDBT
+chmod +x "$TMP_DIR/dbt"
+OBSERR_BIN="$ROOT_DIR/target/debug/obserr"
+
+run_out="$("$OBSERR_BIN" run --job dbt_cli_demo --server "http://127.0.0.1:${OBSERR_PORT}" --token secret-dbt-token \
+  --external-url "https://ci.internal/dbt/cli-demo/1" -- "$TMP_DIR/dbt" build)"
+assert_contains "$run_out" "Completed successfully" "stdout de dbt affiché par obserr run"
+cli_detail="$(curl -fsS -u 'obserr:smoke-secret' "http://127.0.0.1:${OBSERR_PORT}/jobs/dbt-prod/dbt_cli_demo")"
+assert_contains "$cli_detail" "succeeded" "Run succeeded enregistré via obserr run"
+assert_contains "$cli_detail" "https://ci.internal/dbt/cli-demo/1" "external_url transmise par obserr run"
+
+set +e
+OBSERR_URL="http://127.0.0.1:${OBSERR_PORT}" OBSERR_TOKEN=secret-dbt-token FAKE_DBT_FAIL=1 \
+  "$OBSERR_BIN" run --job dbt_cli_demo -- "$TMP_DIR/dbt" build >"$TMP_DIR/run_fail.out" 2>"$TMP_DIR/run_fail.err"
+fail_code=$?
+set -e
+assert_eq "$fail_code" "2" "code de sortie exact de dbt en échec"
+fail_err="$(cat "$TMP_DIR/run_fail.err")"
+assert_contains "$fail_err" "dbt-err-01:" "stderr complet affiché (1re ligne)"
+assert_contains "$fail_err" "dbt-err-25:" "stderr complet affiché (dernière ligne)"
+cli_detail="$(curl -fsS -u 'obserr:smoke-secret' "http://127.0.0.1:${OBSERR_PORT}/jobs/dbt-prod/dbt_cli_demo")"
+assert_contains "$cli_detail" "failed" "Run failed enregistré via obserr run"
+assert_contains "$cli_detail" "dbt-err-06:" "extrait = 20 dernières lignes (début)"
+assert_contains "$cli_detail" "dbt-err-25:" "extrait = 20 dernières lignes (fin)"
+assert_not_contains "$cli_detail" "dbt-err-05:" "ligne 5 hors de l'extrait"
+assert_contains "$(cat "$WEBHOOK_LOG")" "dbt-err-25:" "extrait stderr dans l'alerte Slack du CLI"
+
+set +e
+"$OBSERR_BIN" run --job dbt_cli_demo --server "http://127.0.0.1:1" --token secret-dbt-token \
+  -- "$TMP_DIR/dbt" build >/dev/null 2>"$TMP_DIR/run_down.err"
+down_ok=$?
+FAKE_DBT_FAIL=1 "$OBSERR_BIN" run --job dbt_cli_demo --server "http://127.0.0.1:1" --token secret-dbt-token \
+  -- "$TMP_DIR/dbt" build >/dev/null 2>&1
+down_ko=$?
+set -e
+assert_eq "$down_ok" "0" "serveur injoignable : code 0 conservé"
+assert_eq "$down_ko" "2" "serveur injoignable : code 2 conservé"
+assert_contains "$(cat "$TMP_DIR/run_down.err")" "warning" "avertissement court sur stderr"
+
+echo "✅ Smoke test local réussi (binaire obserr serve + obserr run + SQLite sur disque + Schedules/Hot-reload + Slack + authentification/htmx/rétention vérifiés)."
 
 if [[ "$KEEP_RUNNING" == "true" ]]; then
   echo ""
