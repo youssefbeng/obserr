@@ -163,10 +163,14 @@ async fn post_json_webhook(url: &str, body: &str) -> Result<()> {
 
 /// Extrait `(host, port, path)` d'une URL HTTP sans dépendre du crate `axum`.
 fn parse_http_url(url: &str) -> Result<(&str, u16, &str)> {
+    if url.starts_with("https://") {
+        return Err(anyhow!(
+            "HTTPS webhook endpoints are not supported directly; please use an http:// endpoint or reverse proxy"
+        ));
+    }
     let rest = url
         .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))
-        .ok_or_else(|| anyhow!("webhook URL must start with http:// or https://"))?;
+        .ok_or_else(|| anyhow!("webhook URL must start with http://"))?;
 
     let (authority, path) = match rest.find('/') {
         Some(idx) => (&rest[..idx], &rest[idx..]),
