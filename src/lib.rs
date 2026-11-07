@@ -93,10 +93,10 @@ impl AppState {
         if !changed {
             return;
         }
-        if let Ok(new_config) = Config::from_toml_str(&content) {
-            if self.reload_config(new_config, registered_at).is_ok() {
-                *self.last_toml_content.lock().expect("toml mutex poisoned") = Some(content);
-            }
+        if let Ok(new_config) = Config::from_toml_str(&content)
+            && self.reload_config(new_config, registered_at).is_ok()
+        {
+            *self.last_toml_content.lock().expect("toml mutex poisoned") = Some(content);
         }
     }
 

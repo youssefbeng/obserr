@@ -82,7 +82,8 @@ impl TzifData {
         let typecnt1 = read_u32(36)?;
         let charcnt1 = read_u32(40)?;
 
-        let v1_data_len = timecnt1 * 5 + typecnt1 * 6 + charcnt1 + leapcnt1 * 8 + isstdcnt1 + isutcnt1;
+        let v1_data_len =
+            timecnt1 * 5 + typecnt1 * 6 + charcnt1 + leapcnt1 * 8 + isstdcnt1 + isutcnt1;
         let v2_hdr = 44 + v1_data_len;
         if bytes.get(v2_hdr..v2_hdr + 4) != Some(b"TZif") {
             return None;
@@ -131,7 +132,10 @@ impl TzifData {
             self.default_utoff
         } else {
             let type_idx = self.type_indices[idx - 1] as usize;
-            self.utoffs.get(type_idx).copied().unwrap_or(self.default_utoff)
+            self.utoffs
+                .get(type_idx)
+                .copied()
+                .unwrap_or(self.default_utoff)
         }
     }
 }
@@ -157,10 +161,10 @@ pub fn parse_timezone(name: &str) -> Result<Timezone> {
 
     if !trimmed.starts_with('/') && !trimmed.contains("..") {
         let zpath = Path::new("/usr/share/zoneinfo").join(trimmed);
-        if let Ok(bytes) = std::fs::read(zpath) {
-            if let Some(tzif) = TzifData::from_bytes(&bytes) {
-                return Ok(Timezone::Tzif(Arc::new(tzif)));
-            }
+        if let Ok(bytes) = std::fs::read(zpath)
+            && let Some(tzif) = TzifData::from_bytes(&bytes)
+        {
+            return Ok(Timezone::Tzif(Arc::new(tzif)));
         }
     }
 
@@ -276,9 +280,8 @@ fn is_us_dst(utc: DateTime<Utc>, std_offset_secs: i32) -> bool {
         Utc.from_utc_datetime(&(dst_start_local - Duration::seconds(std_offset_secs as i64)));
 
     let dst_end_local = nov_first_sun.and_hms_opt(2, 0, 0).unwrap();
-    let dst_end = Utc.from_utc_datetime(
-        &(dst_end_local - Duration::seconds((std_offset_secs + 3600) as i64)),
-    );
+    let dst_end = Utc
+        .from_utc_datetime(&(dst_end_local - Duration::seconds((std_offset_secs + 3600) as i64)));
 
     utc >= dst_start && utc < dst_end
 }
@@ -416,10 +419,10 @@ impl Schedule {
         let mut ts = (after.timestamp().div_euclid(60) + 1) * 60;
         let limit = ts + 86_400 * 366;
         while ts <= limit {
-            if let Some(dt) = Utc.timestamp_opt(ts, 0).single() {
-                if self.matches(dt) {
-                    return Some(dt);
-                }
+            if let Some(dt) = Utc.timestamp_opt(ts, 0).single()
+                && self.matches(dt)
+            {
+                return Some(dt);
             }
             ts += 60;
         }
@@ -454,10 +457,10 @@ impl Schedule {
         let mut slots = Vec::new();
         let mut ts = start_ts;
         while ts <= end_ts {
-            if let Some(dt) = Utc.timestamp_opt(ts, 0).single() {
-                if self.matches(dt) {
-                    slots.push(dt);
-                }
+            if let Some(dt) = Utc.timestamp_opt(ts, 0).single()
+                && self.matches(dt)
+            {
+                slots.push(dt);
             }
             ts += 60;
         }
@@ -495,7 +498,9 @@ fn parse_cron_field(field: &str, min: u32, max: u32, is_dow: bool) -> Result<u64
                 .parse()
                 .map_err(|_| anyhow!("invalid cron range end '{b}' in '{field}'"))?;
             if s_val < min || e_val > max || s_val > e_val {
-                return Err(anyhow!("cron range '{range_part}' out of bounds [{min}..={max}]"));
+                return Err(anyhow!(
+                    "cron range '{range_part}' out of bounds [{min}..={max}]"
+                ));
             }
             (s_val, e_val)
         } else {
@@ -786,21 +791,21 @@ pub fn evaluate_incident_transition(
         return IncidentTransition::None;
     }
 
-    if completed.status == RunStatus::Succeeded {
-        if let Some(inc) = open_incident {
-            let duration_seconds = (event.timestamp - inc.opened_at).num_seconds().max(0);
-            return IncidentTransition::Close {
-                incident_id: inc.id,
-                closing_run_id: completed.run_id,
-                notification: IncidentNotification::Resolved {
-                    source: event.source.clone(),
-                    job_name: event.job_name.clone(),
-                    opened_at: inc.opened_at,
-                    closed_at: event.timestamp,
-                    duration_seconds,
-                },
-            };
-        }
+    if completed.status == RunStatus::Succeeded
+        && let Some(inc) = open_incident
+    {
+        let duration_seconds = (event.timestamp - inc.opened_at).num_seconds().max(0);
+        return IncidentTransition::Close {
+            incident_id: inc.id,
+            closing_run_id: completed.run_id,
+            notification: IncidentNotification::Resolved {
+                source: event.source.clone(),
+                job_name: event.job_name.clone(),
+                opened_at: inc.opened_at,
+                closed_at: event.timestamp,
+                duration_seconds,
+            },
+        };
     }
 
     IncidentTransition::None

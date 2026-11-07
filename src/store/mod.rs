@@ -579,8 +579,9 @@ impl Store {
                 .iter()
                 .find_map(|r| r.external_url.clone().filter(|s| !s.is_empty()));
 
-            if latest_error_excerpt.is_none() && incident.cause == IncidentCause::MissedRun {
-                if let Some(missed) = self
+            if latest_error_excerpt.is_none()
+                && incident.cause == IncidentCause::MissedRun
+                && let Some(missed) = self
                     .conn
                     .query_row(
                         &sql_latest_missed,
@@ -588,9 +589,8 @@ impl Store {
                         Self::map_missed_run_row,
                     )
                     .optional()?
-                {
-                    latest_error_excerpt = Some(missed.summary_text());
-                }
+            {
+                latest_error_excerpt = Some(missed.summary_text());
             }
 
             summaries.push(OpenIncidentSummary {

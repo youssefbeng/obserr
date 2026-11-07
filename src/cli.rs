@@ -12,7 +12,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::process::Command;
 
-
 /// Paramètres de la sous-commande `obserr run`, déjà résolus depuis les options CLI ou l'environnement.
 #[derive(Debug, Clone)]
 pub struct RunOptions {

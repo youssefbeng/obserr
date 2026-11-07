@@ -176,3 +176,27 @@ def test_fallback_uses_loaded_task_instances_when_new_session_commit_is_prohibit
     L.on_dag_run_failed(dr, "")
     assert server.requests[0][2]["failed_step"] == "boom"
 
+
+def test_python_deliverables_have_docstrings():
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3]
+    for rel in (
+        "integrations/airflow/obserr_airflow_listener.py",
+        "sandbox/slack_receiver.py",
+        "sandbox/airflow/dags/sandbox_dags.py",
+    ):
+        tree = ast.parse((root / rel).read_text(encoding="utf-8"), filename=rel)
+        assert ast.get_docstring(tree), f"{rel}: docstring de module manquante"
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                assert ast.get_docstring(node), f"{rel}:{node.lineno} {node.name} sans docstring"
+                if isinstance(node, ast.ClassDef):
+                    for item in node.body:
+                        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            assert ast.get_docstring(item), (
+                                f"{rel}:{item.lineno} {node.name}.{item.name} sans docstring"
+                            )
+
+
