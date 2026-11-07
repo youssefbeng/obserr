@@ -153,13 +153,29 @@ def _read_task_log_excerpt(dag_id: str, run_id: str, task_id: str) -> Optional[s
         return None
 
 
+def _iter_task_instances(dag_run: Any):
+    """Récupère les tâches du DAG run sans déclencher de commit parasite dans le scheduler."""
+    tis = getattr(dag_run, "task_instances", None)
+    if tis:
+        return tis
+    try:
+        from sqlalchemy.orm import object_session
+
+        session = object_session(dag_run)
+        if session is not None:
+            return dag_run.get_task_instances(session=session)
+    except Exception:
+        pass
+    return dag_run.get_task_instances()
+
+
 def _find_failed_task(dag_run: Any, dag_id: str, run_id: str) -> Tuple[Optional[str], Optional[str]]:
     """Retrouve la tâche en échec : mémoire du processus, sinon interrogation du DAG run."""
     known = _failed_tasks.pop((dag_id, run_id), None)
     if known:
         return known
     try:
-        for ti in dag_run.get_task_instances():
+        for ti in _iter_task_instances(dag_run):
             state = getattr(ti, "state", "")
             if str(getattr(state, "value", state)) == "failed":
                 task_id = str(ti.task_id)
