@@ -142,3 +142,22 @@ def test_enum_like_failed_state_is_detected(server):
     state = SimpleNamespace(value="failed")
     L.on_dag_run_failed(dag_run([("a", "success"), ("b", state)]), "")
     assert server.requests[0][2]["failed_step"] == "b"
+
+
+def test_fallback_reads_error_excerpt_from_task_log(server, tmp_path, monkeypatch):
+    d = tmp_path / "dag_id=etl" / "run_id=manual__2026" / "task_id=transform"
+    d.mkdir(parents=True)
+    (d / "attempt=1.log").write_text("old attempt\n")
+    (d / "attempt=2.log").write_text("start\nValueError: bad column\n")
+    monkeypatch.setattr(L, "_log_folder", lambda: str(tmp_path))
+    L.on_dag_run_failed(dag_run([("transform", "failed")]), "")
+    body = server.requests[0][2]
+    assert body["failed_step"] == "transform"
+    assert "ValueError: bad column" in body["error_excerpt"]
+    assert "old attempt" not in body["error_excerpt"]
+
+
+def test_missing_task_log_is_ignored(server, tmp_path, monkeypatch):
+    monkeypatch.setattr(L, "_log_folder", lambda: str(tmp_path))
+    L.on_dag_run_failed(dag_run([("transform", "failed")]), "")
+    assert "error_excerpt" not in server.requests[0][2]

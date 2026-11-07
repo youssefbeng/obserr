@@ -19,6 +19,7 @@ log = logging.getLogger("obserr.airflow_listener")
 
 TIMEOUT_SECONDS = 3.0
 EXCERPT_MAX_CHARS = 500
+LOG_TAIL_LINES = 10
 
 # Échecs de tâches vus dans ce processus, par (dag_id, run_id) -> (task_id, extrait).
 _failed_tasks: Dict[Tuple[str, str], Tuple[str, Optional[str]]] = {}
@@ -117,6 +118,41 @@ def _ids(dag_run: Any) -> Tuple[str, str]:
     return str(dag_run.dag_id), str(dag_run.run_id)
 
 
+def _log_folder() -> Optional[str]:
+    """Retourne le dossier des logs de tâches d'Airflow (None si indisponible)."""
+    try:
+        from airflow.configuration import conf
+
+        return conf.get("logging", "base_log_folder", fallback=None)
+    except Exception:
+        return None
+
+
+def _read_task_log_excerpt(dag_id: str, run_id: str, task_id: str) -> Optional[str]:
+    """Lit la fin du dernier log local de la tâche (le scheduler n'a pas l'erreur en mémoire).
+
+    Ne fonctionne que si les logs sont lisibles depuis ce processus (système de fichiers partagé).
+    """
+    try:
+        base = _log_folder()
+        if not base:
+            return None
+        folder = os.path.join(
+            base, "dag_id=%s" % dag_id, "run_id=%s" % run_id, "task_id=%s" % task_id
+        )
+        attempts = sorted(
+            (n for n in os.listdir(folder) if n.startswith("attempt=") and n.endswith(".log")),
+            key=lambda n: int(n[len("attempt="):-len(".log")] or 0),
+        )
+        if not attempts:
+            return None
+        with open(os.path.join(folder, attempts[-1]), "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+        return _truncate("\n".join(lines[-LOG_TAIL_LINES:]))
+    except Exception:
+        return None
+
+
 def _find_failed_task(dag_run: Any, dag_id: str, run_id: str) -> Tuple[Optional[str], Optional[str]]:
     """Retrouve la tâche en échec : mémoire du processus, sinon interrogation du DAG run."""
     known = _failed_tasks.pop((dag_id, run_id), None)
@@ -126,7 +162,8 @@ def _find_failed_task(dag_run: Any, dag_id: str, run_id: str) -> Tuple[Optional[
         for ti in dag_run.get_task_instances():
             state = getattr(ti, "state", "")
             if str(getattr(state, "value", state)) == "failed":
-                return str(ti.task_id), None
+                task_id = str(ti.task_id)
+                return task_id, _read_task_log_excerpt(dag_id, run_id, task_id)
     except Exception as exc:
         log.warning("obserr: tâche en échec introuvable (%s)", exc)
     return None, None

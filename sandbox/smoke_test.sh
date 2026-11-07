@@ -453,6 +453,18 @@ L.on_dag_run_running(bad, "")
 ti = SimpleNamespace(dag_id="af_bad", run_id="run_bad", task_id="load_orders")
 L.on_task_instance_failed(None, ti, *([RuntimeError("kaboom")] if L._airflow_major() >= 3 else []))
 L.on_dag_run_failed(bad, "")
+
+# Repli scheduler : tâche en échec retrouvée via le DAG run, extrait lu dans le log local.
+import os, tempfile
+logs = tempfile.mkdtemp()
+d = os.path.join(logs, "dag_id=af_log", "run_id=run_log", "task_id=build_report")
+os.makedirs(d)
+open(os.path.join(d, "attempt=1.log"), "w").write("ligne\nKeyError: smoke-log-excerpt\n")
+L._log_folder = lambda: logs
+fb = SimpleNamespace(dag_id="af_log", run_id="run_log",
+                     get_task_instances=lambda: [SimpleNamespace(task_id="build_report", state="failed")])
+L.on_dag_run_running(fb, "")
+L.on_dag_run_failed(fb, "")
 PY
 af_ok="$(curl -fsS -u 'obserr:smoke-secret' "http://127.0.0.1:${OBSERR_PORT}/jobs/airflow-prod/af_ok")"
 assert_contains "$af_ok" "succeeded" "Run Airflow succeeded via plugin"
@@ -460,6 +472,9 @@ assert_contains "$af_ok" "http://airflow.local:8080/dags/af_ok/" "external_url A
 af_bad="$(curl -fsS -u 'obserr:smoke-secret' "http://127.0.0.1:${OBSERR_PORT}/jobs/airflow-prod/af_bad")"
 assert_contains "$af_bad" "failed" "Run Airflow failed via plugin"
 assert_contains "$af_bad" "load_orders" "Step en échec capturé par le plugin"
+af_log="$(curl -fsS -u 'obserr:smoke-secret' "http://127.0.0.1:${OBSERR_PORT}/jobs/airflow-prod/af_log")"
+assert_contains "$af_log" "build_report" "Step retrouvé via le DAG run (repli scheduler)"
+assert_contains "$af_log" "smoke-log-excerpt" "Extrait d'erreur lu dans le log de la tâche"
 OBSERR_URL="http://127.0.0.1:1" OBSERR_TOKEN=x python3 -c "
 import obserr_airflow_listener as L
 from types import SimpleNamespace
