@@ -41,7 +41,10 @@ impl SlackWebhook {
 
     /// Met à jour à chaud l'URL de l'*Incoming Webhook* Slack lors d'un rechargement du fichier TOML.
     pub fn set_webhook_url(&self, webhook_url: Option<String>) {
-        *self.webhook_url.lock().expect("slack webhook mutex poisoned") = webhook_url;
+        *self
+            .webhook_url
+            .lock()
+            .expect("slack webhook mutex poisoned") = webhook_url;
     }
 
     /// Formate le texte du message Slack d'ouverture ou de résolution d'`Incident`.

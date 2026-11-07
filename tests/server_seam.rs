@@ -218,8 +218,14 @@ async fn failed_run_records_step_and_truncates_error_excerpt_to_20_lines() {
     assert!(html.contains("failed"));
     assert!(html.contains("load_ledger_task"));
     assert!(html.contains("https://airflow.internal/dags/finance_dag/grid?dag_run_id=dagrun-42"));
-    assert!(!html.contains("err-line-05"), "first 5 lines should be truncated");
-    assert!(html.contains("err-line-06"), "line 6 (first of last 20) should be kept");
+    assert!(
+        !html.contains("err-line-05"),
+        "first 5 lines should be truncated"
+    );
+    assert!(
+        html.contains("err-line-06"),
+        "line 6 (first of last 20) should be kept"
+    );
     assert!(html.contains("err-line-25"), "line 25 should be kept");
     assert!(html.contains("Failed Runs : 1"));
 }
@@ -352,13 +358,19 @@ async fn new_started_event_marks_previous_running_run_with_different_run_id_as_a
 
     assert!(html.contains("run-stuck"));
     assert!(html.contains("abandoned"));
-    assert!(html.contains("3600s"), "abandoned run should have finished_at set to new run start");
+    assert!(
+        html.contains("3600s"),
+        "abandoned run should have finished_at set to new run start"
+    );
     assert!(html.contains("run-next"));
     assert!(html.contains("running"));
     assert!(html.contains("Failed Runs : 1"));
 }
 
-async fn spawn_slack_webhook_receiver() -> (String, std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
+async fn spawn_slack_webhook_receiver() -> (
+    String,
+    std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+) {
     let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
     let received_clone = std::sync::Arc::clone(&received);
 
@@ -436,12 +448,29 @@ async fn first_failed_run_opens_incident_and_sends_single_slack_webhook_with_con
 
     let messages = slack_messages.lock().unwrap().clone();
     assert_eq!(messages.len(), 1, "expected exactly 1 Slack webhook call");
-    let text = messages[0]["text"].as_str().expect("Slack payload must have text field");
-    assert!(text.contains("orders_mart"), "Slack alert must contain Job name: {text}");
-    assert!(text.contains("dbt-prod"), "Slack alert must contain Source: {text}");
-    assert!(text.contains("Failed Run"), "Slack alert must contain failure nature: {text}");
-    assert!(text.contains("2026-11-03T08:15:00Z"), "Slack alert must contain timestamp: {text}");
-    assert!(text.contains("stg_orders"), "Slack alert must contain failed Step: {text}");
+    let text = messages[0]["text"]
+        .as_str()
+        .expect("Slack payload must have text field");
+    assert!(
+        text.contains("orders_mart"),
+        "Slack alert must contain Job name: {text}"
+    );
+    assert!(
+        text.contains("dbt-prod"),
+        "Slack alert must contain Source: {text}"
+    );
+    assert!(
+        text.contains("Failed Run"),
+        "Slack alert must contain failure nature: {text}"
+    );
+    assert!(
+        text.contains("2026-11-03T08:15:00Z"),
+        "Slack alert must contain timestamp: {text}"
+    );
+    assert!(
+        text.contains("stg_orders"),
+        "Slack alert must contain failed Step: {text}"
+    );
     assert!(
         text.contains("relation \"raw.orders\" does not exist"),
         "Slack alert must contain error excerpt: {text}"
@@ -510,7 +539,11 @@ async fn abandoned_previous_run_opens_incident_and_sends_single_slack_webhook() 
     assert_eq!(second_start.status(), StatusCode::OK);
 
     let messages = slack_messages.lock().unwrap().clone();
-    assert_eq!(messages.len(), 1, "abandoned run should trigger 1 Slack alert");
+    assert_eq!(
+        messages.len(),
+        1,
+        "abandoned run should trigger 1 Slack alert"
+    );
     let text = messages[0]["text"].as_str().unwrap();
     assert!(text.contains("inventory_sync"));
     assert!(text.contains("airflow-prod"));
@@ -521,7 +554,8 @@ async fn abandoned_previous_run_opens_incident_and_sends_single_slack_webhook() 
 }
 
 #[tokio::test]
-async fn consecutive_failed_runs_are_silent_and_succeeded_run_closes_incident_with_resolution_alert() {
+async fn consecutive_failed_runs_are_silent_and_succeeded_run_closes_incident_with_resolution_alert()
+ {
     let (webhook_url, slack_messages) = spawn_slack_webhook_receiver().await;
     let app = test_app_with_slack(&webhook_url);
 
@@ -588,7 +622,11 @@ async fn consecutive_failed_runs_are_silent_and_succeeded_run_closes_incident_wi
     assert_eq!(recovery_res.status(), StatusCode::OK);
 
     let messages = slack_messages.lock().unwrap().clone();
-    assert_eq!(messages.len(), 2, "expected 1 opening alert + 1 resolution alert");
+    assert_eq!(
+        messages.len(),
+        2,
+        "expected 1 opening alert + 1 resolution alert"
+    );
     let resolved_text = messages[1]["text"].as_str().unwrap();
     assert!(
         resolved_text.contains("✅ Résolu"),
@@ -724,8 +762,12 @@ async fn open_incidents_appear_at_top_of_dashboard_on_incidents_page_and_in_job_
     assert_eq!(dash_res.status(), StatusCode::OK);
     let dash_html = body_string(dash_res).await;
     assert!(dash_html.contains("Incident ouvert"));
-    let pos_broken = dash_html.find("orders_broken").expect("orders_broken on dashboard");
-    let pos_healthy = dash_html.find("alpha_healthy").expect("alpha_healthy on dashboard");
+    let pos_broken = dash_html
+        .find("orders_broken")
+        .expect("orders_broken on dashboard");
+    let pos_healthy = dash_html
+        .find("alpha_healthy")
+        .expect("alpha_healthy on dashboard");
     assert!(
         pos_broken < pos_healthy,
         "Job with open Incident must appear at the top of the Dashboard before healthy Jobs"
@@ -747,8 +789,14 @@ async fn open_incidents_appear_at_top_of_dashboard_on_incidents_page_and_in_job_
     let incidents_html = body_string(incidents_res).await;
     assert!(incidents_html.contains("orders_broken"));
     assert!(incidents_html.contains("dbt-prod"));
-    assert!(incidents_html.contains("2026-11-03T10:00:00Z"), "must show Incident opening time");
-    assert!(incidents_html.contains("Failed Run"), "must show initial cause");
+    assert!(
+        incidents_html.contains("2026-11-03T10:00:00Z"),
+        "must show Incident opening time"
+    );
+    assert!(
+        incidents_html.contains("Failed Run"),
+        "must show initial cause"
+    );
     assert!(
         incidents_html.contains("latest failure excerpt on orders_broken"),
         "must show latest error excerpt"
@@ -1003,7 +1051,8 @@ tags = ["adhoc"]
 }
 
 #[tokio::test]
-async fn tick_respects_grace_period_and_declares_single_missed_run_unless_covered_by_started_or_finished_run() {
+async fn tick_respects_grace_period_and_declares_single_missed_run_unless_covered_by_started_or_finished_run()
+ {
     let config = Config::from_toml_str(
         r#"
 [sources.dbt-prod]
@@ -1189,7 +1238,8 @@ grace = "15m"
 }
 
 #[tokio::test]
-async fn tick_evaluates_schedule_in_job_or_global_timezone_including_summer_winter_dst_transitions() {
+async fn tick_evaluates_schedule_in_job_or_global_timezone_including_summer_winter_dst_transitions()
+{
     // Global timezone is Europe/Paris; one Job uses global Europe/Paris (08:00 local),
     // another Job overrides timezone with UTC (08:00 UTC).
     let config = Config::from_toml_str(
@@ -1401,7 +1451,11 @@ grace = "15m"
         .unwrap();
 
     let messages = slack_messages.lock().unwrap().clone();
-    assert_eq!(messages.len(), 1, "Missed Run must send 1 Slack opening alert");
+    assert_eq!(
+        messages.len(),
+        1,
+        "Missed Run must send 1 Slack opening alert"
+    );
     let open_text = messages[0]["text"].as_str().unwrap();
     assert!(open_text.contains("revenue_daily"));
     assert!(open_text.contains("airflow-prod"));
@@ -1483,7 +1537,11 @@ grace = "15m"
     assert_eq!(recovery_res.status(), StatusCode::OK);
 
     let messages_after = slack_messages.lock().unwrap().clone();
-    assert_eq!(messages_after.len(), 2, "expected 1 opening alert + 1 resolution alert");
+    assert_eq!(
+        messages_after.len(),
+        2,
+        "expected 1 opening alert + 1 resolution alert"
+    );
     let resolved_text = messages_after[1]["text"].as_str().unwrap();
     assert!(resolved_text.contains("✅ Résolu"));
     assert!(resolved_text.contains("revenue_daily"));
@@ -1507,11 +1565,13 @@ grace = "15m"
 }
 
 #[tokio::test]
-async fn no_retroactive_missed_runs_before_schedule_registration_and_hot_reload_updates_live_server() {
+async fn no_retroactive_missed_runs_before_schedule_registration_and_hot_reload_updates_live_server()
+ {
     let (webhook_url_1, slack_1) = spawn_slack_webhook_receiver().await;
     let (webhook_url_2, slack_2) = spawn_slack_webhook_receiver().await;
 
-    let tmp_dir = std::env::temp_dir().join(format!("obserr-test-hotreload-{}", std::process::id()));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("obserr-test-hotreload-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let config_path = tmp_dir.join("obserr.toml");
 
@@ -1653,17 +1713,6 @@ tags = ["v2", "hot-reloaded"]
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
-
-
-
-
-
-
-
-
-
-
-
 
 /// Exercises optional web authentication and credential rotation without changing ingestion auth.
 #[tokio::test]
