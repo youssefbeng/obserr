@@ -1,0 +1,13 @@
+[project]
+name = "obserr-airflow-listener"
+version = "0.1.0"
+description = "Plugin listener Airflow envoyant les DAG runs à obserr"
+requires-python = ">=3.9,<3.13"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=7"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

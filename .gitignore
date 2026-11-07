@@ -8,3 +8,6 @@ GLOSSARY.md
 *.db-wal
 *.db-shm
 
+integrations/airflow/.venv/
+__pycache__/
+.pytest_cache/
