@@ -101,12 +101,14 @@ def test_missing_url_does_not_raise(monkeypatch):
 
 def test_unreachable_server_does_not_raise(monkeypatch):
     monkeypatch.setenv("OBSERR_URL", "http://127.0.0.1:1")
+    monkeypatch.setenv("OBSERR_TOKEN", "tok")
     L.on_dag_run_success(dag_run(), "")
 
 
 def test_http_error_does_not_raise(monkeypatch):
     s = _Server(status=500)
     monkeypatch.setenv("OBSERR_URL", s.url)
+    monkeypatch.setenv("OBSERR_TOKEN", "tok")
     try:
         L.on_dag_run_failed(dag_run(), "")
         assert len(s.requests) == 1
@@ -117,6 +119,7 @@ def test_http_error_does_not_raise(monkeypatch):
 def test_slow_server_times_out(monkeypatch):
     s = _Server(delay=1.0)
     monkeypatch.setenv("OBSERR_URL", s.url)
+    monkeypatch.setenv("OBSERR_TOKEN", "tok")
     monkeypatch.setattr(L, "TIMEOUT_SECONDS", 0.2)
     try:
         assert L.send_event({"job": "x"}) is False
@@ -127,3 +130,15 @@ def test_slow_server_times_out(monkeypatch):
 def test_broken_dag_run_does_not_raise(server):
     L.on_dag_run_running(object(), "")
     L.on_dag_run_success(object(), "")
+
+
+def test_missing_token_skips_request(server, monkeypatch):
+    monkeypatch.delenv("OBSERR_TOKEN")
+    assert L.send_event({"job": "x"}) is False
+    assert server.requests == []
+
+
+def test_enum_like_failed_state_is_detected(server):
+    state = SimpleNamespace(value="failed")
+    L.on_dag_run_failed(dag_run([("a", "success"), ("b", state)]), "")
+    assert server.requests[0][2]["failed_step"] == "b"

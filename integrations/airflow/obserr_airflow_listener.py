@@ -88,10 +88,14 @@ def send_event(payload: Dict[str, Any]) -> bool:
         if not url:
             log.warning("obserr: OBSERR_URL absent, événement ignoré")
             return False
-        headers = {"Content-Type": "application/json"}
         token = os.environ.get("OBSERR_TOKEN")
-        if token:
-            headers["Authorization"] = "Bearer " + token
+        if not token:
+            log.warning("obserr: OBSERR_TOKEN absent, événement ignoré")
+            return False
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + token,
+        }
         request = urllib.request.Request(
             url.rstrip("/") + "/api/v1/events",
             data=json.dumps(payload).encode("utf-8"),
@@ -120,7 +124,8 @@ def _find_failed_task(dag_run: Any, dag_id: str, run_id: str) -> Tuple[Optional[
         return known
     try:
         for ti in dag_run.get_task_instances():
-            if str(getattr(ti, "state", "")) == "failed":
+            state = getattr(ti, "state", "")
+            if str(getattr(state, "value", state)) == "failed":
                 return str(ti.task_id), None
     except Exception as exc:
         log.warning("obserr: tâche en échec introuvable (%s)", exc)

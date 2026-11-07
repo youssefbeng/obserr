@@ -460,7 +460,7 @@ assert_contains "$af_ok" "http://airflow.local:8080/dags/af_ok/" "external_url A
 af_bad="$(curl -fsS -u 'obserr:smoke-secret' "http://127.0.0.1:${OBSERR_PORT}/jobs/airflow-prod/af_bad")"
 assert_contains "$af_bad" "failed" "Run Airflow failed via plugin"
 assert_contains "$af_bad" "load_orders" "Step en échec capturé par le plugin"
-OBSERR_URL="http://127.0.0.1:1" python3 -c "
+OBSERR_URL="http://127.0.0.1:1" OBSERR_TOKEN=x python3 -c "
 import obserr_airflow_listener as L
 from types import SimpleNamespace
 L.on_dag_run_running(SimpleNamespace(dag_id='x', run_id='y'), '')"
