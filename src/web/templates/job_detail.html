@@ -7,6 +7,7 @@
 <p>
   <strong>Statut :</strong> {{ status_label }} |
   <strong>Schedule :</strong> {{ schedule_summary }} |
+  <strong>Fuseau :</strong> {{ effective_timezone }} |
   <strong>Propriétaire :</strong> {{ owner }} |
   <strong>Tags :</strong> {{ tags }} |
   <strong>Prochain créneau attendu :</strong> {{ next_slot }}
@@ -99,7 +100,10 @@
       {% if !run.error_excerpt.is_empty() %}
       <tr>
         <td colspan="7">
-          <pre>{{ run.error_excerpt }}</pre>
+          <details open>
+            <summary>Extrait d'erreur</summary>
+            <pre>{{ run.error_excerpt }}</pre>
+          </details>
         </td>
       </tr>
       {% endif %}

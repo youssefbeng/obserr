@@ -9,8 +9,9 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{SecondsFormat, Utc};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::process::Command;
+
+use crate::http::{HTTP_TIMEOUT, post_json};
 
 /// Paramètres de la sous-commande `obserr run`, déjà résolus depuis les options CLI ou l'environnement.
 #[derive(Debug, Clone)]
@@ -158,9 +159,6 @@ fn exit_code_of(status: ExitStatus) -> i32 {
     1
 }
 
-/// Délai maximal d'une tentative d'envoi d'événement (connexion, requête et réponse).
-const HTTP_TIMEOUT: Duration = Duration::from_secs(2);
-
 /// Attente avant chaque tentative : une tentative immédiate puis deux réessais rapides (ADR-0004).
 const RETRY_BACKOFFS: [Duration; 3] = [
     Duration::ZERO,
@@ -244,10 +242,9 @@ impl Reporter {
             if attempt > 0 {
                 tokio::time::sleep(*backoff).await;
             }
-            match tokio::time::timeout(HTTP_TIMEOUT, post_json(url, token, &body)).await {
-                Ok(Ok(())) => return,
-                Ok(Err(err)) => last_err = Some(err),
-                Err(_) => last_err = Some(anyhow!("timed out after {HTTP_TIMEOUT:?}")),
+            match post_json(url, Some(token), &body, HTTP_TIMEOUT).await {
+                Ok(()) => return,
+                Err(err) => last_err = Some(err),
             }
         }
         if let Some(err) = last_err {
@@ -258,55 +255,4 @@ impl Reporter {
 
 fn now_rfc3339() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
-}
-
-/// Envoie une requête HTTP `POST` JSON authentifiée par jeton Bearer et vérifie une réponse `2xx`.
-async fn post_json(url: &str, token: &str, body: &str) -> Result<()> {
-    let (host, port, path) = parse_http_url(url)?;
-    let mut stream = TcpStream::connect((host, port))
-        .await
-        .with_context(|| format!("failed to connect to {host}:{port}"))?;
-    let req = format!(
-        "POST {path} HTTP/1.1\r\n\
-         Host: {host}:{port}\r\n\
-         Authorization: Bearer {token}\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\r\n\
-         {body}",
-        body.len()
-    );
-    stream.write_all(req.as_bytes()).await?;
-    let mut resp = Vec::new();
-    stream.read_to_end(&mut resp).await?;
-    let head = String::from_utf8_lossy(&resp);
-    let status_line = head.lines().next().unwrap_or_default();
-    if !status_line.starts_with("HTTP/1.1 2") && !status_line.starts_with("HTTP/1.0 2") {
-        return Err(anyhow!("server answered `{status_line}`"));
-    }
-    Ok(())
-}
-
-/// Extrait `(host, port, path)` d'une URL HTTP d'un serveur `obserr`. Rejette explicitement HTTPS.
-fn parse_http_url(url: &str) -> Result<(&str, u16, &str)> {
-    if url.starts_with("https://") {
-        return Err(anyhow!(
-            "HTTPS server URLs are not supported directly by obserr run; please use http:// or an HTTP proxy"
-        ));
-    }
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| anyhow!("server URL must start with http://"))?;
-
-    let (authority, path) = match rest.find('/') {
-        Some(idx) => (&rest[..idx], &rest[idx..]),
-        None => (rest, "/"),
-    };
-
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) => (h, p.parse::<u16>().context("invalid server port")?),
-        None => (authority, 80),
-    };
-
-    Ok((host, port, path))
 }

@@ -2,7 +2,6 @@
 
 use std::process::{Command, Output};
 
-use chrono::Utc;
 use obserr::{AppState, config::Config, domain::RunStatus, store::Store, web};
 
 const TOKEN: &str = "secret-dbt-token";
@@ -47,9 +46,8 @@ fn s(v: &str) -> String {
 }
 
 fn runs_of(state: &AppState, job: &str) -> Vec<obserr::domain::Run> {
-    let store = state.store.lock().unwrap();
-    store
-        .get_job_details("dbt-prod", job, "UTC", Utc::now())
+    state
+        .get_job_details("dbt-prod", job)
         .unwrap()
         .map(|d| d.runs)
         .unwrap_or_default()
