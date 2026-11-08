@@ -6,10 +6,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::config::Config;
 use crate::domain::{
-    CompletedRunOutcome, Incident, IncidentCause, IncidentNotification, IncidentStatus,
-    IncidentTransition, IngestEvent, Job, JobDetails, JobWithLatestRun, MissedRun,
-    OpenIncidentSummary, Run, RunCorrelation, RunStatus, correlate_event,
-    evaluate_incident_transition, evaluate_missed_run_incident, is_slot_covered_by_runs,
+    Incident, IncidentCause, IncidentNotification, IncidentStatus, IncidentTransition, IngestEvent,
+    Job, JobDetails, JobWithLatestRun, MissedRun, OpenIncidentSummary, Run, RunCorrelation,
+    RunStatus, evaluate_missed_run_incident, is_slot_covered_by_runs, plan_run_ingestion,
 };
 
 const MIGRATION_0001: &str = include_str!("migrations/0001_initial.sql");
@@ -141,19 +140,13 @@ impl Store {
                     )?;
                 }
                 Some(prev_job) => {
-                    let schedule_changed = prev_job.schedule_cron != job_cfg.schedule_cron
-                        || prev_job.timezone != job_cfg.timezone;
-
-                    let (new_reg_str, new_last_slot_str) = if job_cfg.schedule_cron.is_none() {
-                        (None, None)
-                    } else if schedule_changed {
-                        (reg_str.clone(), None)
-                    } else {
-                        (
-                            prev_job.schedule_registered_at.as_ref().map(format_ts),
-                            prev_job.last_scheduled_slot.as_ref().map(format_ts),
-                        )
-                    };
+                    let (new_reg, new_last_slot) = prev_job.reconcile_schedule_state(
+                        job_cfg.schedule_cron.as_deref(),
+                        job_cfg.timezone.as_deref(),
+                        registered_at,
+                    );
+                    let new_reg_str = new_reg.as_ref().map(format_ts);
+                    let new_last_slot_str = new_last_slot.as_ref().map(format_ts);
 
                     tx.execute(
                         "UPDATE jobs
@@ -276,7 +269,13 @@ impl Store {
         tx.execute("DELETE FROM incidents WHERE status = 'closed' AND julianday(closed_at) < julianday(?1)", [&cutoff])?;
         tx.execute(
             "DELETE FROM runs WHERE julianday(finished_at) < julianday(?1)
-                    AND id NOT IN (SELECT MAX(id) FROM runs GROUP BY job_id)",
+                    AND id NOT IN (SELECT MAX(id) FROM runs GROUP BY job_id)
+                    AND id NOT IN (
+                        SELECT MAX(r.id) FROM runs r
+                        JOIN incidents i ON i.job_id = r.job_id
+                        WHERE i.status = 'open' AND r.status IN ('failed', 'abandoned')
+                        GROUP BY r.job_id
+                    )",
             [&cutoff],
         )?;
         tx.execute(
@@ -305,35 +304,17 @@ impl Store {
 
         let running_runs = Self::load_running_runs_in_tx(&tx, job_id)?;
         let open_incident = Self::load_open_incident(&tx, job_id)?;
-        let correlation = correlate_event(&running_runs, event);
-        let mut transition = IncidentTransition::None;
+        let plan = plan_run_ingestion(&running_runs, open_incident.as_ref(), event);
+        let mut inserted_finished_run_id = None;
 
-        match correlation {
+        match &plan.correlation {
             RunCorrelation::KeepRunningRun { .. } => {}
             RunCorrelation::StartNewRun { abandon_run_ids } => {
-                for &abandoned_id in &abandon_run_ids {
+                for &abandoned_id in abandon_run_ids {
                     tx.execute(
                         "UPDATE runs SET status = ?1, finished_at = ?2 WHERE id = ?3",
                         params![RunStatus::Abandoned.as_str(), ts_str, abandoned_id],
                     )?;
-                }
-                if let Some(&last_abandoned_id) = abandon_run_ids.last() {
-                    let abandoned_url = running_runs
-                        .iter()
-                        .find(|r| r.id == last_abandoned_id)
-                        .and_then(|r| r.external_url.clone());
-
-                    transition = evaluate_incident_transition(
-                        open_incident.as_ref(),
-                        event,
-                        CompletedRunOutcome {
-                            run_id: last_abandoned_id,
-                            status: RunStatus::Abandoned,
-                            failed_step: None,
-                            error_excerpt: None,
-                            external_url: abandoned_url,
-                        },
-                    );
                 }
                 tx.execute(
                     "INSERT INTO runs (job_id, external_run_id, status, started_at, external_url)
@@ -352,47 +333,31 @@ impl Store {
                 status,
                 failed_step,
                 error_excerpt,
+                external_url,
             } => {
-                let prev_external_url = running_runs
-                    .iter()
-                    .find(|r| r.id == run_id)
-                    .and_then(|r| r.external_url.clone());
-                let effective_external_url = event.external_url.clone().or(prev_external_url);
-
                 tx.execute(
                     "UPDATE runs
                      SET status = ?1,
                          finished_at = ?2,
                          failed_step = ?3,
                          error_excerpt = ?4,
-                         external_url = COALESCE(?5, external_url)
+                         external_url = ?5
                      WHERE id = ?6",
                     params![
                         status.as_str(),
                         ts_str,
                         failed_step,
                         error_excerpt,
-                        event.external_url,
+                        external_url,
                         run_id
                     ],
                 )?;
-
-                transition = evaluate_incident_transition(
-                    open_incident.as_ref(),
-                    event,
-                    CompletedRunOutcome {
-                        run_id,
-                        status,
-                        failed_step,
-                        error_excerpt,
-                        external_url: effective_external_url,
-                    },
-                );
             }
             RunCorrelation::InsertFinishedRunWithoutStart {
                 status,
                 failed_step,
                 error_excerpt,
+                external_url,
             } => {
                 tx.execute(
                     "INSERT INTO runs (
@@ -406,25 +371,14 @@ impl Store {
                         ts_str,
                         failed_step,
                         error_excerpt,
-                        event.external_url
+                        external_url
                     ],
                 )?;
-                let inserted_run_id = tx.last_insert_rowid();
-
-                transition = evaluate_incident_transition(
-                    open_incident.as_ref(),
-                    event,
-                    CompletedRunOutcome {
-                        run_id: inserted_run_id,
-                        status,
-                        failed_step,
-                        error_excerpt,
-                        external_url: event.external_url.clone(),
-                    },
-                );
+                inserted_finished_run_id = Some(tx.last_insert_rowid());
             }
         }
 
+        let transition = plan.into_transition(inserted_finished_run_id);
         let notification =
             Self::apply_incident_transition_in_tx(&tx, job_id, &ts_str, None, transition)?;
         tx.commit()?;
@@ -547,12 +501,7 @@ impl Store {
         let incidents_iter = stmt.query_map([], Self::map_incident_row)?;
 
         let sql_job = format!("{SELECT_JOB_COLUMNS} WHERE id = ?1");
-        let sql_failed_runs = format!(
-            "{SELECT_RUN_COLUMNS} WHERE job_id = ?1 \
-             AND COALESCE(finished_at, started_at) >= ?2 \
-             AND (?3 IS NULL OR id >= ?3) \
-             AND status IN ('failed', 'abandoned') ORDER BY id DESC"
-        );
+        let sql_runs = format!("{SELECT_RUN_COLUMNS} WHERE job_id = ?1 ORDER BY id DESC");
         let sql_latest_missed =
             format!("{SELECT_MISSED_RUN_COLUMNS} WHERE job_id = ?1 ORDER BY id DESC LIMIT 1");
 
@@ -563,42 +512,26 @@ impl Store {
                 .conn
                 .query_row(&sql_job, params![incident.job_id], Self::map_job_row)?;
 
-            let opened_str = format_ts(&incident.opened_at);
-            let mut stmt_runs = self.conn.prepare(&sql_failed_runs)?;
-            let failed_runs = stmt_runs
-                .query_map(
-                    params![job.id, opened_str, incident.opening_run_id],
-                    Self::map_run_row,
-                )?
+            let mut stmt_runs = self.conn.prepare(&sql_runs)?;
+            let runs = stmt_runs
+                .query_map(params![job.id], Self::map_run_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
 
-            let mut latest_error_excerpt = failed_runs
-                .iter()
-                .find_map(|r| r.error_excerpt.clone().filter(|s| !s.is_empty()));
-            let external_url = failed_runs
-                .iter()
-                .find_map(|r| r.external_url.clone().filter(|s| !s.is_empty()));
+            let latest_missed = self
+                .conn
+                .query_row(
+                    &sql_latest_missed,
+                    params![job.id],
+                    Self::map_missed_run_row,
+                )
+                .optional()?;
 
-            if latest_error_excerpt.is_none()
-                && incident.cause == IncidentCause::MissedRun
-                && let Some(missed) = self
-                    .conn
-                    .query_row(
-                        &sql_latest_missed,
-                        params![job.id],
-                        Self::map_missed_run_row,
-                    )
-                    .optional()?
-            {
-                latest_error_excerpt = Some(missed.summary_text());
-            }
-
-            summaries.push(OpenIncidentSummary {
+            summaries.push(OpenIncidentSummary::from_domain(
                 incident,
                 job,
-                latest_error_excerpt,
-                external_url,
-            });
+                &runs,
+                latest_missed.as_ref(),
+            ));
         }
 
         Ok(summaries)

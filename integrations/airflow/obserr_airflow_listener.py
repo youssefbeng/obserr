@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Dict, Optional, Tuple
@@ -18,8 +19,10 @@ from urllib.parse import quote
 log = logging.getLogger("obserr.airflow_listener")
 
 TIMEOUT_SECONDS = 3.0
-EXCERPT_MAX_CHARS = 500
-LOG_TAIL_LINES = 10
+RETRY_BACKOFFS = (0.0, 0.1)
+LOG_TAIL_LINES = 20
+MAX_LINE_CHARS = 4096
+MAX_TRACKED_FAILURES = 256
 
 # Échecs de tâches vus dans ce processus, par (dag_id, run_id) -> (task_id, extrait).
 _failed_tasks: Dict[Tuple[str, str], Tuple[str, Optional[str]]] = {}
@@ -43,13 +46,14 @@ def _airflow_major() -> int:
 
 
 def _truncate(text: Any) -> Optional[str]:
-    """Garde la fin du message d'erreur (la plus informative) et le borne à une taille courte."""
+    """Conserve uniquement les 20 dernières lignes de l'extrait d'erreur (ADR-0003)."""
     if text is None:
         return None
     value = str(text).strip()
     if not value:
         return None
-    return value[-EXCERPT_MAX_CHARS:]
+    lines = [line[-MAX_LINE_CHARS:] for line in value.splitlines()[-LOG_TAIL_LINES:]]
+    return "\n".join(lines)
 
 
 def _airflow_base_url() -> str:
@@ -83,33 +87,48 @@ def build_dag_run_url(dag_id: str, run_id: str) -> str:
 
 
 def send_event(payload: Dict[str, Any]) -> bool:
-    """Poste un événement à obserr ; ne lève jamais d'exception et retourne si l'envoi a réussi."""
-    try:
-        url = os.environ.get("OBSERR_URL")
-        if not url:
-            log.warning("obserr: OBSERR_URL absent, événement ignoré")
-            return False
-        token = os.environ.get("OBSERR_TOKEN")
-        if not token:
-            log.warning("obserr: OBSERR_TOKEN absent, événement ignoré")
-            return False
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": "Bearer " + token,
-        }
-        request = urllib.request.Request(
-            url.rstrip("/") + "/api/v1/events",
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS):
-            pass
-        return True
-    except urllib.error.HTTPError as exc:
-        log.warning("obserr: réponse HTTP %s, événement ignoré", exc.code)
-    except Exception as exc:
-        log.warning("obserr: envoi impossible (%s), événement ignoré", exc)
+    """Poste un événement à obserr avec un bref réessai (ADR-0004) ; ne lève jamais d'exception."""
+    url = os.environ.get("OBSERR_URL")
+    if not url:
+        log.warning("obserr: OBSERR_URL absent, événement ignoré")
+        return False
+    token = os.environ.get("OBSERR_TOKEN")
+    if not token:
+        log.warning("obserr: OBSERR_TOKEN absent, événement ignoré")
+        return False
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + token,
+    }
+    endpoint = url.rstrip("/") + "/api/v1/events"
+    data = json.dumps(payload).encode("utf-8")
+
+    last_http_code: Optional[int] = None
+    last_exc: Optional[Exception] = None
+    for attempt, backoff in enumerate(RETRY_BACKOFFS):
+        if attempt > 0 and backoff > 0:
+            time.sleep(backoff)
+        try:
+            request = urllib.request.Request(
+                endpoint,
+                data=data,
+                headers=headers,
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS):
+                pass
+            return True
+        except urllib.error.HTTPError as exc:
+            last_http_code = exc.code
+            if exc.code < 500:
+                break
+        except Exception as exc:
+            last_exc = exc
+
+    if last_http_code is not None:
+        log.warning("obserr: réponse HTTP %s, événement ignoré", last_http_code)
+    elif last_exc is not None:
+        log.warning("obserr: envoi impossible (%s), événement ignoré", last_exc)
     return False
 
 
@@ -219,9 +238,11 @@ def _on_finished(dag_run: Any, status: str) -> None:
 
 
 def _remember_failure(task_instance: Any, error: Any) -> None:
-    """Mémorise la tâche en échec (et son erreur) pour l'envoi de `finished` du DAG run."""
+    """Mémorise la tâche en échec (et son erreur) dans un cache borné pour l'envoi de `finished`."""
     try:
         key = (str(task_instance.dag_id), str(task_instance.run_id))
+        if key not in _failed_tasks and len(_failed_tasks) >= MAX_TRACKED_FAILURES:
+            _failed_tasks.pop(next(iter(_failed_tasks)), None)
         _failed_tasks.setdefault(key, (str(task_instance.task_id), _truncate(error)))
     except Exception as exc:
         log.warning("obserr: échec de tâche non mémorisé (%s)", exc)

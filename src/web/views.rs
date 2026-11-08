@@ -11,7 +11,6 @@ use serde::Deserialize;
 
 use crate::{
     AppState,
-    config::format_grace_duration,
     domain::{Incident, Job, JobWithLatestRun, MissedRun, OpenIncidentSummary, Run},
 };
 
@@ -63,19 +62,16 @@ struct JobViewMeta {
 }
 
 impl JobViewMeta {
+    /// Prépare les métadonnées formatées d'un `Job` pour les templates HTML du Tableau de bord et de la page détail.
     fn from_job(
         job: &Job,
         has_open_incident: bool,
         effective_timezone: &str,
         next_expected_slot: Option<DateTime<Utc>>,
     ) -> Self {
-        let schedule_summary = match job.schedule_cron.as_deref() {
-            Some(cron) => {
-                let grace_str = format_grace_duration(job.grace_seconds.unwrap_or(0));
-                format!("{cron} (grace {grace_str}, {effective_timezone})")
-            }
-            None => "-".to_string(),
-        };
+        let schedule_summary = job
+            .schedule_summary(effective_timezone)
+            .unwrap_or_else(|| "-".to_string());
         let owner = job.owner.clone().unwrap_or_else(|| "-".to_string());
         let tags = if job.tags.is_empty() {
             "-".to_string()
@@ -237,6 +233,7 @@ struct JobDetailTemplate {
     name: String,
     status_label: String,
     schedule_summary: String,
+    effective_timezone: String,
     owner: String,
     tags: String,
     next_slot: String,
@@ -293,11 +290,8 @@ pub struct DashboardFilters {
 impl DashboardFilters {
     /// Filtre les Jobs sur leur état métier et leurs métadonnées exactes.
     fn matches(&self, item: &JobWithLatestRun) -> bool {
-        let status_matches = self.status.is_empty()
-            || matches!(
-                (self.status.as_str(), item.status_label()),
-                ("incident", "Incident ouvert") | ("ok", "OK") | ("unscheduled", "Sans Schedule")
-            );
+        let status_matches =
+            self.status.is_empty() || self.status.as_str() == item.health_status().filter_slug();
         status_matches
             && (self.source.is_empty() || item.job.source == self.source)
             && (self.tag.is_empty() || item.job.tags.contains(&self.tag))
@@ -310,14 +304,9 @@ pub async fn dashboard(
     Query(filters): Query<DashboardFilters>,
     headers: HeaderMap,
 ) -> Result<Html<String>, StatusCode> {
-    let cfg = state.current_config();
-    let items = {
-        let store = state.store.lock().expect("store mutex poisoned");
-        let ref_now = store.last_tick_now().unwrap_or_else(Utc::now);
-        store
-            .list_jobs_with_latest_run(&cfg.server.timezone, ref_now)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    };
+    let items = state
+        .list_dashboard_jobs()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut sources: BTreeSet<String> = items.iter().map(|item| item.job.source.clone()).collect();
     let mut tags: BTreeSet<String> = items
         .iter()
@@ -353,12 +342,9 @@ pub async fn incidents(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Html<String>, StatusCode> {
-    let summaries = {
-        let store = state.store.lock().expect("store mutex poisoned");
-        store
-            .list_open_incidents()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    };
+    let summaries = state
+        .list_open_incidents()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let rows = summaries.into_iter().map(OpenIncidentRow::from).collect();
     let tpl = IncidentsTemplate {
         refresh_path: "/incidents",
@@ -377,14 +363,9 @@ pub async fn job_detail(
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
-    let cfg = state.current_config();
-    let details_opt = {
-        let store = state.store.lock().expect("store mutex poisoned");
-        let ref_now = store.last_tick_now().unwrap_or_else(Utc::now);
-        store
-            .get_job_details(&source, &name, &cfg.server.timezone, ref_now)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    };
+    let details_opt = state
+        .get_job_details(&source, &name)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let Some(details) = details_opt else {
         return Ok(StatusCode::NOT_FOUND.into_response());
@@ -406,6 +387,7 @@ pub async fn job_detail(
         name: details.job.name,
         status_label: meta.status_label,
         schedule_summary: meta.schedule_summary,
+        effective_timezone: details.effective_timezone,
         owner: meta.owner,
         tags: meta.tags,
         next_slot: meta.next_slot,

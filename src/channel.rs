@@ -2,49 +2,50 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::Result;
 use chrono::SecondsFormat;
 use serde_json::json;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 use crate::domain::IncidentNotification;
+use crate::http::{HTTP_TIMEOUT, post_json};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Interface de notification consommée par le moteur d'`Incidents` (`ADR-0005`).
 pub trait Channel: Send + Sync {
     /// Envoie de manière asynchrone une notification d'`Incident` sur ce `Channel`.
-    fn send<'a>(
-        &'a self,
-        notification: &'a IncidentNotification,
-        public_url: &'a str,
-    ) -> BoxFuture<'a, Result<()>>;
+    fn send<'a>(&'a self, notification: &'a IncidentNotification) -> BoxFuture<'a, Result<()>>;
+}
 
-    /// Met à jour à chaud l'URL de destination du `Channel` lors d'un rechargement de configuration.
-    fn update_webhook_url(&self, _webhook_url: Option<String>) {}
+#[derive(Debug, Clone)]
+struct SlackEndpoint {
+    webhook_url: Option<String>,
+    public_url: String,
 }
 
 /// Adapter de `Channel` envoyant les alertes vers un *Incoming Webhook* Slack (compatible offre gratuite).
 #[derive(Debug, Clone)]
 pub struct SlackWebhook {
-    webhook_url: Arc<Mutex<Option<String>>>,
+    endpoint: Arc<Mutex<SlackEndpoint>>,
 }
 
 impl SlackWebhook {
-    /// Construit un adapter `SlackWebhook` à partir de l'URL de webhook optionnelle issue de la configuration.
-    pub fn new(webhook_url: Option<String>) -> Self {
+    /// Construit un adapter `SlackWebhook` à partir de l'URL de webhook optionnelle et de l'URL publique `obserr`.
+    pub fn new(webhook_url: Option<String>, public_url: impl Into<String>) -> Self {
         Self {
-            webhook_url: Arc::new(Mutex::new(webhook_url)),
+            endpoint: Arc::new(Mutex::new(SlackEndpoint {
+                webhook_url,
+                public_url: public_url.into(),
+            })),
         }
     }
 
-    /// Met à jour à chaud l'URL de l'*Incoming Webhook* Slack lors d'un rechargement du fichier TOML.
-    pub fn set_webhook_url(&self, webhook_url: Option<String>) {
-        *self
-            .webhook_url
-            .lock()
-            .expect("slack webhook mutex poisoned") = webhook_url;
+    /// Met à jour à chaud la configuration de l'adapter (`webhook_url` et `public_url`) lors d'un rechargement TOML.
+    pub fn reconfigure(&self, webhook_url: Option<String>, public_url: impl Into<String>) {
+        *self.endpoint.lock().expect("slack webhook mutex poisoned") = SlackEndpoint {
+            webhook_url,
+            public_url: public_url.into(),
+        };
     }
 
     /// Formate le texte du message Slack d'ouverture ou de résolution d'`Incident`.
@@ -110,85 +111,23 @@ fn format_human_duration(seconds: i64) -> String {
 }
 
 impl Channel for SlackWebhook {
-    fn send<'a>(
-        &'a self,
-        notification: &'a IncidentNotification,
-        public_url: &'a str,
-    ) -> BoxFuture<'a, Result<()>> {
-        let url_opt = self
-            .webhook_url
-            .lock()
-            .expect("slack webhook mutex poisoned")
-            .clone()
-            .filter(|u| !u.is_empty());
+    fn send<'a>(&'a self, notification: &'a IncidentNotification) -> BoxFuture<'a, Result<()>> {
+        let (url_opt, public_url) = {
+            let ep = self.endpoint.lock().expect("slack webhook mutex poisoned");
+            (
+                ep.webhook_url.clone().filter(|u| !u.is_empty()),
+                ep.public_url.clone(),
+            )
+        };
         Box::pin(async move {
             let Some(url) = url_opt else {
                 return Ok(());
             };
-            let text = Self::format_message(notification, public_url);
+            let text = Self::format_message(notification, &public_url);
             let body = json!({ "text": text }).to_string();
-            post_json_webhook(&url, &body).await
+            post_json(&url, None, &body, HTTP_TIMEOUT).await
         })
     }
-
-    fn update_webhook_url(&self, webhook_url: Option<String>) {
-        self.set_webhook_url(webhook_url);
-    }
-}
-
-/// Envoie une requête HTTP `POST` JSON vers l'URL de webhook fournie.
-async fn post_json_webhook(url: &str, body: &str) -> Result<()> {
-    let (host, port, path) = parse_http_url(url)?;
-
-    let mut stream = TcpStream::connect((host, port))
-        .await
-        .with_context(|| format!("failed to connect to webhook at {host}:{port}"))?;
-
-    let req = format!(
-        "POST {path} HTTP/1.1\r\n\
-         Host: {host}:{port}\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\r\n\
-         {body}",
-        body.len()
-    );
-    stream.write_all(req.as_bytes()).await?;
-
-    let mut resp = Vec::new();
-    stream.read_to_end(&mut resp).await?;
-    let status_line = String::from_utf8_lossy(&resp);
-    if !status_line.starts_with("HTTP/1.1 2") && !status_line.starts_with("HTTP/1.0 2") {
-        return Err(anyhow!("webhook returned non-2xx response: {status_line}"));
-    }
-    Ok(())
-}
-
-/// Extrait `(host, port, path)` d'une URL HTTP sans dépendre du crate `axum`.
-fn parse_http_url(url: &str) -> Result<(&str, u16, &str)> {
-    if url.starts_with("https://") {
-        return Err(anyhow!(
-            "HTTPS webhook endpoints are not supported directly; please use an http:// endpoint or reverse proxy"
-        ));
-    }
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| anyhow!("webhook URL must start with http://"))?;
-
-    let (authority, path) = match rest.find('/') {
-        Some(idx) => (&rest[..idx], &rest[idx..]),
-        None => (rest, "/"),
-    };
-
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) => (h, p.parse::<u16>().context("invalid webhook port")?),
-        None => (authority, 80),
-    };
-
-    if host.is_empty() {
-        return Err(anyhow!("webhook URL missing host"));
-    }
-    Ok((host, port, path))
 }
 
 /// Adapter de `Channel` en mémoire enregistrant les notifications émises pour les tests.
@@ -210,11 +149,7 @@ impl MemoryChannel {
 }
 
 impl Channel for MemoryChannel {
-    fn send<'a>(
-        &'a self,
-        notification: &'a IncidentNotification,
-        _public_url: &'a str,
-    ) -> BoxFuture<'a, Result<()>> {
+    fn send<'a>(&'a self, notification: &'a IncidentNotification) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             self.notifications
                 .lock()

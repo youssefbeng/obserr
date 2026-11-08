@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use chrono::{
     DateTime, Datelike, Duration, FixedOffset, NaiveDate, SecondsFormat, TimeZone, Timelike, Utc,
 };
@@ -468,6 +468,7 @@ impl Schedule {
     }
 }
 
+/// Parse un champ individuel d'une expression cron standard à 5 champs en masque de bits `u64`.
 fn parse_cron_field(field: &str, min: u32, max: u32, is_dow: bool) -> Result<u64> {
     let mut mask = 0u64;
     for part in field.split(',') {
@@ -527,6 +528,43 @@ fn parse_cron_field(field: &str, min: u32, max: u32, is_dow: bool) -> Result<u64
     Ok(mask)
 }
 
+/// État de santé synthétique d'un `Job` affiché et filtré sur le Tableau de bord.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobHealthStatus {
+    IncidentOpen,
+    Ok,
+    Unscheduled,
+}
+
+impl JobHealthStatus {
+    /// Libellé métier affiché dans l'interface web.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::IncidentOpen => "Incident ouvert",
+            Self::Ok => "OK",
+            Self::Unscheduled => "Sans Schedule",
+        }
+    }
+
+    /// Valeur du paramètre de requête `?status=` correspondant à cet état.
+    pub fn filter_slug(self) -> &'static str {
+        match self {
+            Self::IncidentOpen => "incident",
+            Self::Ok => "ok",
+            Self::Unscheduled => "unscheduled",
+        }
+    }
+
+    /// Rang de tri sur le Tableau de bord : `Incident ouvert` (0), puis `OK` (1), puis `Sans Schedule` (2).
+    pub fn sort_rank(self) -> u8 {
+        match self {
+            Self::IncidentOpen => 0,
+            Self::Ok => 1,
+            Self::Unscheduled => 2,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Job {
     pub id: i64,
@@ -559,15 +597,46 @@ impl Job {
         Schedule::new(cron, grace, tz).ok()
     }
 
+    /// Formate le résumé d'affichage du `Schedule` du `Job` (`"{cron} (grace {grace}, {tz})"`).
+    pub fn schedule_summary(&self, default_timezone: &str) -> Option<String> {
+        let cron = self.schedule_cron.as_deref()?;
+        let grace_str = format_grace_duration(self.grace_seconds.unwrap_or(0));
+        let tz = self.effective_timezone(default_timezone);
+        Some(format!("{cron} (grace {grace_str}, {tz})"))
+    }
+
+    /// Détermine l'état `(schedule_registered_at, last_scheduled_slot)` lors d'une synchronisation de configuration.
+    pub fn reconcile_schedule_state(
+        &self,
+        new_cron: Option<&str>,
+        new_timezone: Option<&str>,
+        registered_at: Option<DateTime<Utc>>,
+    ) -> (Option<DateTime<Utc>>, Option<DateTime<Utc>>) {
+        let schedule_changed =
+            self.schedule_cron.as_deref() != new_cron || self.timezone.as_deref() != new_timezone;
+        if new_cron.is_none() {
+            (None, None)
+        } else if schedule_changed {
+            (registered_at, None)
+        } else {
+            (self.schedule_registered_at, self.last_scheduled_slot)
+        }
+    }
+
+    /// Calcule l'état de santé synthétique du `Job` (`IncidentOpen`, `Ok` ou `Unscheduled`).
+    pub fn health_status(&self, has_open_incident: bool) -> JobHealthStatus {
+        if has_open_incident {
+            JobHealthStatus::IncidentOpen
+        } else if self.schedule_cron.is_some() {
+            JobHealthStatus::Ok
+        } else {
+            JobHealthStatus::Unscheduled
+        }
+    }
+
     /// Retourne le statut métier du `Job` (`Incident ouvert`, `OK` ou `Sans Schedule`).
     pub fn status_label(&self, has_open_incident: bool) -> &'static str {
-        if has_open_incident {
-            "Incident ouvert"
-        } else if self.schedule_cron.is_some() {
-            "OK"
-        } else {
-            "Sans Schedule"
-        }
+        self.health_status(has_open_incident).label()
     }
 }
 
@@ -695,7 +764,7 @@ impl IncidentCause {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Incident {
     pub id: i64,
     pub job_id: i64,
@@ -752,52 +821,46 @@ pub enum IncidentTransition {
     },
 }
 
-/// Contexte d'un `Run` terminé transmis au moteur d'évaluation des `Incidents`.
-#[derive(Debug, Clone)]
-pub struct CompletedRunOutcome {
-    pub run_id: i64,
-    pub status: RunStatus,
-    pub failed_step: Option<Step>,
-    pub error_excerpt: Option<String>,
-    pub external_url: Option<String>,
-}
-
 /// Évalue la transition d'`Incident` provoquée par un `Run` terminé (`Failed Run` ou `succeeded`).
-pub fn evaluate_incident_transition(
+fn evaluate_run_incident_transition(
     open_incident: Option<&Incident>,
     event: &IngestEvent,
-    completed: CompletedRunOutcome,
+    run_id: i64,
+    status: RunStatus,
+    failed_step: Option<Step>,
+    error_excerpt: Option<String>,
+    external_url: Option<String>,
 ) -> IncidentTransition {
-    if completed.status.is_failed_run() {
+    if status.is_failed_run() {
         if open_incident.is_none() {
-            let cause = match completed.status {
+            let cause = match status {
                 RunStatus::Abandoned => IncidentCause::AbandonedRun,
                 _ => IncidentCause::FailedRun,
             };
             return IncidentTransition::Open {
                 cause,
-                opening_run_id: Some(completed.run_id),
+                opening_run_id: Some(run_id),
                 notification: IncidentNotification::Opened {
                     source: event.source.clone(),
                     job_name: event.job_name.clone(),
                     cause,
                     opened_at: event.timestamp,
-                    failed_step: completed.failed_step,
-                    error_excerpt: completed.error_excerpt,
-                    external_url: completed.external_url,
+                    failed_step,
+                    error_excerpt,
+                    external_url,
                 },
             };
         }
         return IncidentTransition::None;
     }
 
-    if completed.status == RunStatus::Succeeded
+    if status == RunStatus::Succeeded
         && let Some(inc) = open_incident
     {
         let duration_seconds = (event.timestamp - inc.opened_at).num_seconds().max(0);
         return IncidentTransition::Close {
             incident_id: inc.id,
-            closing_run_id: completed.run_id,
+            closing_run_id: run_id,
             notification: IncidentNotification::Resolved {
                 source: event.source.clone(),
                 job_name: event.job_name.clone(),
@@ -846,20 +909,19 @@ pub struct JobWithLatestRun {
 }
 
 impl JobWithLatestRun {
+    /// Retourne l'état de santé typé du `Job`.
+    pub fn health_status(&self) -> JobHealthStatus {
+        self.job.health_status(self.open_incident.is_some())
+    }
+
     /// Retourne le statut métier du `Job` (`Incident ouvert`, `OK` ou `Sans Schedule`).
     pub fn status_label(&self) -> &'static str {
-        self.job.status_label(self.open_incident.is_some())
+        self.health_status().label()
     }
 
     /// Rang de tri sur le Tableau de bord : `Incident ouvert` (0), puis `OK` (1), puis `Sans Schedule` (2).
     pub fn sort_rank(&self) -> u8 {
-        if self.open_incident.is_some() {
-            0
-        } else if self.job.schedule_cron.is_some() {
-            1
-        } else {
-            2
-        }
+        self.health_status().sort_rank()
     }
 }
 
@@ -869,6 +931,47 @@ pub struct OpenIncidentSummary {
     pub job: Job,
     pub latest_error_excerpt: Option<String>,
     pub external_url: Option<String>,
+}
+
+impl OpenIncidentSummary {
+    /// Construit le résumé d'un `Incident` ouvert en sélectionnant le dernier extrait d'erreur (`Failed Run` ou `Missed Run`) et le lien vers la `Source`.
+    pub fn from_domain(
+        incident: Incident,
+        job: Job,
+        runs_desc: &[Run],
+        latest_missed_run: Option<&MissedRun>,
+    ) -> Self {
+        let eligible_failed_runs: Vec<&Run> = runs_desc
+            .iter()
+            .filter(|r| {
+                r.is_failed_run()
+                    && r.coverage_timestamp()
+                        .is_some_and(|ts| ts >= incident.opened_at)
+                    && incident.opening_run_id.is_none_or(|min_id| r.id >= min_id)
+            })
+            .collect();
+
+        let mut latest_error_excerpt = eligible_failed_runs
+            .iter()
+            .find_map(|r| r.error_excerpt.clone().filter(|s| !s.is_empty()));
+        let external_url = eligible_failed_runs
+            .iter()
+            .find_map(|r| r.external_url.clone().filter(|s| !s.is_empty()));
+
+        if latest_error_excerpt.is_none()
+            && incident.cause == IncidentCause::MissedRun
+            && let Some(missed) = latest_missed_run
+        {
+            latest_error_excerpt = Some(missed.summary_text());
+        }
+
+        Self {
+            incident,
+            job,
+            latest_error_excerpt,
+            external_url,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -906,7 +1009,7 @@ impl FinishedOutcome {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IngestPayloadKind {
     Started,
     Finished {
@@ -916,7 +1019,7 @@ pub enum IngestPayloadKind {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestEvent {
     pub source: Source,
     pub job_name: String,
@@ -933,19 +1036,131 @@ pub enum RunCorrelation {
     StartNewRun { abandon_run_ids: Vec<i64> },
     /// Événement `started` idempotent sur un `Run` déjà `running` avec le même `run_id`.
     KeepRunningRun { existing_run_id: i64 },
-    /// Met à jour un `Run` en cours existant avec son état de fin.
+    /// Met à jour un `Run` en cours existant avec son état de fin et son `external_url` résolue.
     FinishExistingRun {
         run_id: i64,
         status: RunStatus,
         failed_step: Option<Step>,
         error_excerpt: Option<String>,
+        external_url: Option<String>,
     },
     /// Crée directement un `Run` terminé sans horodatage de début (`finished` reçu seul).
     InsertFinishedRunWithoutStart {
         status: RunStatus,
         failed_step: Option<Step>,
         error_excerpt: Option<String>,
+        external_url: Option<String>,
     },
+}
+
+/// Plan complet d'ingestion d'un événement de `Run` associant la mutation de `Run` et la transition d'`Incident`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunIngestionPlan {
+    pub correlation: RunCorrelation,
+    transition: PlannedIncidentTransition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PlannedIncidentTransition {
+    Ready(IncidentTransition),
+    NeedsInsertedRunId {
+        open_incident: Option<Incident>,
+        event: IngestEvent,
+        status: RunStatus,
+        failed_step: Option<Step>,
+        error_excerpt: Option<String>,
+        external_url: Option<String>,
+    },
+}
+
+impl RunIngestionPlan {
+    /// Finalise la transition d'`Incident` (en injectant l'identifiant du `Run` inséré lorsque `finished` arrive sans `started`).
+    pub fn into_transition(self, inserted_run_id: Option<i64>) -> IncidentTransition {
+        match self.transition {
+            PlannedIncidentTransition::Ready(t) => t,
+            PlannedIncidentTransition::NeedsInsertedRunId {
+                open_incident,
+                event,
+                status,
+                failed_step,
+                error_excerpt,
+                external_url,
+            } => evaluate_run_incident_transition(
+                open_incident.as_ref(),
+                &event,
+                inserted_run_id.unwrap_or(0),
+                status,
+                failed_step,
+                error_excerpt,
+                external_url,
+            ),
+        }
+    }
+}
+
+/// Planifie de manière pure la corrélation d'un événement de `Run` et la transition d'`Incident` associée (`ADR-0005`).
+pub fn plan_run_ingestion(
+    running_runs: &[Run],
+    open_incident: Option<&Incident>,
+    event: &IngestEvent,
+) -> RunIngestionPlan {
+    let correlation = correlate_event(running_runs, event);
+    let transition = match &correlation {
+        RunCorrelation::KeepRunningRun { .. } => {
+            PlannedIncidentTransition::Ready(IncidentTransition::None)
+        }
+        RunCorrelation::StartNewRun { abandon_run_ids } => {
+            if let Some(&last_abandoned_id) = abandon_run_ids.last() {
+                let abandoned_url = running_runs
+                    .iter()
+                    .find(|r| r.id == last_abandoned_id)
+                    .and_then(|r| r.external_url.clone());
+                PlannedIncidentTransition::Ready(evaluate_run_incident_transition(
+                    open_incident,
+                    event,
+                    last_abandoned_id,
+                    RunStatus::Abandoned,
+                    None,
+                    None,
+                    abandoned_url,
+                ))
+            } else {
+                PlannedIncidentTransition::Ready(IncidentTransition::None)
+            }
+        }
+        RunCorrelation::FinishExistingRun {
+            run_id,
+            status,
+            failed_step,
+            error_excerpt,
+            external_url,
+        } => PlannedIncidentTransition::Ready(evaluate_run_incident_transition(
+            open_incident,
+            event,
+            *run_id,
+            *status,
+            failed_step.clone(),
+            error_excerpt.clone(),
+            external_url.clone(),
+        )),
+        RunCorrelation::InsertFinishedRunWithoutStart {
+            status,
+            failed_step,
+            error_excerpt,
+            external_url,
+        } => PlannedIncidentTransition::NeedsInsertedRunId {
+            open_incident: open_incident.cloned(),
+            event: event.clone(),
+            status: *status,
+            failed_step: failed_step.clone(),
+            error_excerpt: error_excerpt.clone(),
+            external_url: external_url.clone(),
+        },
+    };
+    RunIngestionPlan {
+        correlation,
+        transition,
+    }
 }
 
 /// Détermine l'action de corrélation (`RunCorrelation`) à appliquer face aux `Runs` en cours d'un `Job`.
@@ -990,20 +1205,85 @@ pub fn correlate_event(running_runs: &[Run], event: &IngestEvent) -> RunCorrelat
             };
 
             if let Some(existing) = matched_run {
+                let effective_external_url = event
+                    .external_url
+                    .clone()
+                    .or_else(|| existing.external_url.clone());
                 RunCorrelation::FinishExistingRun {
                     run_id: existing.id,
                     status,
                     failed_step: failed_step.clone(),
                     error_excerpt: truncated_excerpt,
+                    external_url: effective_external_url,
                 }
             } else {
                 RunCorrelation::InsertFinishedRunWithoutStart {
                     status,
                     failed_step: failed_step.clone(),
                     error_excerpt: truncated_excerpt,
+                    external_url: event.external_url.clone(),
                 }
             }
         }
+    }
+}
+
+/// Parse une durée textuelle (ex. `"30m"`, `"15m"`, `"1h"`, `"45s"`, `"1h30m"`) en nombre de secondes.
+pub fn parse_duration_seconds(input: &str) -> Result<i64> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("empty duration string"));
+    }
+    if let Ok(plain_secs) = trimmed.parse::<i64>() {
+        return Ok(plain_secs.max(0));
+    }
+
+    let mut total_seconds: i64 = 0;
+    let mut num_buf = String::new();
+
+    for ch in trimmed.chars() {
+        if ch.is_ascii_digit() {
+            num_buf.push(ch);
+        } else if ch.is_ascii_whitespace() {
+            continue;
+        } else {
+            if num_buf.is_empty() {
+                return Err(anyhow!("invalid duration '{input}'"));
+            }
+            let val: i64 = num_buf
+                .parse()
+                .with_context(|| format!("invalid number in duration '{input}'"))?;
+            num_buf.clear();
+            let multiplier = match ch {
+                's' | 'S' => 1,
+                'm' | 'M' => 60,
+                'h' | 'H' => 3600,
+                'd' | 'D' => 86400,
+                _ => return Err(anyhow!("unsupported duration unit '{ch}' in '{input}'")),
+            };
+            total_seconds += val * multiplier;
+        }
+    }
+
+    if !num_buf.is_empty() {
+        let val: i64 = num_buf
+            .parse()
+            .with_context(|| format!("invalid trailing number in duration '{input}'"))?;
+        total_seconds += val;
+    }
+
+    Ok(total_seconds.max(0))
+}
+
+/// Formate un délai de tolérance en secondes sous forme compacte (`30m`, `1h`, `45s`).
+pub fn format_grace_duration(seconds: i64) -> String {
+    let s = seconds.max(0);
+    if s > 0 && s % 3600 == 0 {
+        format!("{}h", s / 3600)
+    } else if s > 0 && s % 60 == 0 {
+        format!("{}m", s / 60)
+    } else {
+        format!("{s}s")
     }
 }
 

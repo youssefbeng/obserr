@@ -4,15 +4,15 @@ pub mod views;
 use axum::{
     Json, Router,
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::{
-    AppState,
-    domain::{FinishedOutcome, IngestEvent, IngestPayloadKind},
+    AppState, IngestError,
+    domain::{FinishedOutcome, IngestPayloadKind},
 };
 
 /// Construit le routeur HTTP `axum` exposant `/health`, l'API d'ingestion et les pages du Dashboard.
@@ -36,8 +36,7 @@ pub fn router(state: AppState) -> Router {
 
 /// Vérifie la disponibilité du serveur et de la base SQLite embarquée sans authentification.
 async fn health(State(state): State<AppState>) -> StatusCode {
-    let store = state.store.lock().expect("store mutex poisoned");
-    match store.ping() {
+    match state.check_health() {
         Ok(()) => StatusCode::OK,
         Err(_) => StatusCode::SERVICE_UNAVAILABLE,
     }
@@ -63,16 +62,16 @@ struct EventPayload {
     external_url: Option<String>,
 }
 
-/// Authentifie la `Source` par jeton Bearer, valide le payload JSON et persiste l'événement de `Run`.
+/// Décode l'en-tête Bearer et le payload JSON, puis délègue l'ingestion du `Run` à `AppState`.
 async fn ingest_event(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(payload): Json<EventPayload>,
 ) -> Result<StatusCode, StatusCode> {
-    let event_ts = payload.timestamp.unwrap_or_else(Utc::now);
-    state.reload_if_changed(None);
-    let cfg = state.current_config();
-    let source = auth::authenticate_source(&headers, &cfg)?;
+    let bearer_token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
 
     let kind = match payload.event {
         WireEventType::Started => IngestPayloadKind::Started,
@@ -86,25 +85,20 @@ async fn ingest_event(
         }
     };
 
-    let event = IngestEvent {
-        source,
-        job_name: payload.job,
-        run_id: payload.run_id,
-        timestamp: event_ts,
-        external_url: payload.external_url,
-        kind,
-    };
-
-    let notification = {
-        let mut store = state.store.lock().expect("store mutex poisoned");
-        store
-            .record_event(&event)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    };
-
-    if let Some(alert) = notification {
-        let _ = state.channel.send(&alert, &cfg.server.public_url).await;
-    }
+    state
+        .ingest_event(
+            bearer_token,
+            payload.job,
+            payload.run_id,
+            payload.timestamp.unwrap_or_else(Utc::now),
+            payload.external_url,
+            kind,
+        )
+        .await
+        .map_err(|err| match err {
+            IngestError::Unauthorized => StatusCode::UNAUTHORIZED,
+            IngestError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        })?;
 
     Ok(StatusCode::OK)
 }

@@ -5,6 +5,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
 use crate::domain::{Schedule, parse_timezone};
+pub use crate::domain::{format_grace_duration, parse_duration_seconds};
 
 #[derive(Debug, Clone, Default)]
 pub struct Config {
@@ -69,9 +70,50 @@ fn default_timezone() -> String {
     "UTC".to_string()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct SourceConfig {
     pub token: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawSourceConfig {
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    token_env: Option<String>,
+}
+
+impl RawSourceConfig {
+    /// Résout le jeton d'une `Source` (littéral, `$ENV_VAR`/`${ENV_VAR}` ou `token_env`).
+    fn into_source_config(self, source_name: &str) -> Result<SourceConfig> {
+        if let Some(env_name) = self
+            .token_env
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let token = std::env::var(env_name).with_context(|| {
+                format!("environment variable '{env_name}' for source '{source_name}' is not set")
+            })?;
+            return Ok(SourceConfig { token });
+        }
+        let raw_token = self
+            .token
+            .ok_or_else(|| anyhow!("source '{source_name}' must define 'token' or 'token_env'"))?;
+        let trimmed = raw_token.trim();
+        let resolved = if let Some(var_name) = trimmed
+            .strip_prefix("${")
+            .and_then(|s| s.strip_suffix('}'))
+            .or_else(|| trimmed.strip_prefix('$'))
+        {
+            std::env::var(var_name).with_context(|| {
+                format!("environment variable '{var_name}' for source '{source_name}' is not set")
+            })?
+        } else {
+            raw_token
+        };
+        Ok(SourceConfig { token: resolved })
+    }
 }
 
 /// Configuration déclarative d'un `Job` dans le fichier TOML (`Schedule`, fuseau horaire, propriétaire et `tags`).
@@ -93,7 +135,7 @@ struct RawConfig {
     #[serde(default)]
     channel: ChannelConfig,
     #[serde(default)]
-    sources: HashMap<String, SourceConfig>,
+    sources: HashMap<String, RawSourceConfig>,
     #[serde(default)]
     jobs: HashMap<String, HashMap<String, RawJobBody>>,
 }
@@ -146,65 +188,6 @@ impl RawJobBody {
     }
 }
 
-/// Parse une durée textuelle (ex. `"30m"`, `"15m"`, `"1h"`, `"45s"`, `"1h30m"`) en nombre de secondes.
-pub fn parse_duration_seconds(input: &str) -> Result<i64> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow!("empty duration string"));
-    }
-    if let Ok(plain_secs) = trimmed.parse::<i64>() {
-        return Ok(plain_secs.max(0));
-    }
-
-    let mut total_seconds: i64 = 0;
-    let mut num_buf = String::new();
-
-    for ch in trimmed.chars() {
-        if ch.is_ascii_digit() {
-            num_buf.push(ch);
-        } else if ch.is_ascii_whitespace() {
-            continue;
-        } else {
-            if num_buf.is_empty() {
-                return Err(anyhow!("invalid duration '{input}'"));
-            }
-            let val: i64 = num_buf
-                .parse()
-                .with_context(|| format!("invalid number in duration '{input}'"))?;
-            num_buf.clear();
-            let multiplier = match ch {
-                's' | 'S' => 1,
-                'm' | 'M' => 60,
-                'h' | 'H' => 3600,
-                'd' | 'D' => 86400,
-                _ => return Err(anyhow!("unsupported duration unit '{ch}' in '{input}'")),
-            };
-            total_seconds += val * multiplier;
-        }
-    }
-
-    if !num_buf.is_empty() {
-        let val: i64 = num_buf
-            .parse()
-            .with_context(|| format!("invalid trailing number in duration '{input}'"))?;
-        total_seconds += val;
-    }
-
-    Ok(total_seconds.max(0))
-}
-
-/// Formate un délai de tolérance en secondes sous forme compacte (`30m`, `1h`, `45s`).
-pub fn format_grace_duration(seconds: i64) -> String {
-    let s = seconds.max(0);
-    if s > 0 && s % 3600 == 0 {
-        format!("{}h", s / 3600)
-    } else if s > 0 && s % 60 == 0 {
-        format!("{}m", s / 60)
-    } else {
-        format!("{s}s")
-    }
-}
-
 impl Config {
     /// Parse et valide une configuration serveur à partir d'une chaîne TOML.
     pub fn from_toml_str(content: &str) -> Result<Self> {
@@ -213,6 +196,12 @@ impl Config {
 
         parse_timezone(&raw.server.timezone)
             .with_context(|| format!("invalid global server timezone '{}'", raw.server.timezone))?;
+
+        let mut sources = HashMap::with_capacity(raw.sources.len());
+        for (source_name, raw_src) in raw.sources {
+            let cfg = raw_src.into_source_config(&source_name)?;
+            sources.insert(source_name, cfg);
+        }
 
         let mut jobs = Vec::new();
         let mut source_keys: Vec<_> = raw.jobs.into_iter().collect();
@@ -228,7 +217,7 @@ impl Config {
         Ok(Self {
             server: raw.server,
             channel: raw.channel,
-            sources: raw.sources,
+            sources,
             jobs,
         })
     }

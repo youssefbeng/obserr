@@ -111,9 +111,41 @@ def test_http_error_does_not_raise(monkeypatch):
     monkeypatch.setenv("OBSERR_TOKEN", "tok")
     try:
         L.on_dag_run_failed(dag_run(), "")
+        assert len(s.requests) == len(L.RETRY_BACKOFFS)
+    finally:
+        s.close()
+
+
+def test_http_401_is_not_retried(monkeypatch):
+    s = _Server(status=401)
+    monkeypatch.setenv("OBSERR_URL", s.url)
+    monkeypatch.setenv("OBSERR_TOKEN", "bad")
+    try:
+        L.on_dag_run_failed(dag_run(), "")
         assert len(s.requests) == 1
     finally:
         s.close()
+
+
+def test_truncate_keeps_last_20_lines():
+    raw = "\n".join("line-%d" % i for i in range(1, 31))
+    excerpt = L._truncate(raw)
+    assert excerpt is not None
+    lines = excerpt.splitlines()
+    assert len(lines) == 20
+    assert lines[0] == "line-11"
+    assert lines[-1] == "line-30"
+
+
+def test_failed_tasks_cache_is_bounded(monkeypatch):
+    monkeypatch.setattr(L, "MAX_TRACKED_FAILURES", 3)
+    L._failed_tasks.clear()
+    for idx in range(5):
+        ti = SimpleNamespace(dag_id="etl", run_id="run_%d" % idx, task_id="t_%d" % idx)
+        L._remember_failure(ti, "err")
+    assert len(L._failed_tasks) == 3
+    assert ("etl", "run_0") not in L._failed_tasks
+    assert ("etl", "run_4") in L._failed_tasks
 
 
 def test_slow_server_times_out(monkeypatch):
